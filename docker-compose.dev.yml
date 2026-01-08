@@ -56,6 +56,9 @@ services:
     
     # Environment variables
     environment:
+      # CRITICAL: Required for FlashInfer CUTLASS MoE to work with editable install
+      - PYTHONPATH=/workspace/flashinfer
+      
       # vLLM PR branch for SM121/Blackwell support
       - VLLM_PR_NUMBER=31740
       - VLLM_REF=pr-31740
@@ -121,6 +124,9 @@ services:
       - ./.cache/ccache:/root/.ccache
     
     environment:
+      # CRITICAL: Required for FlashInfer CUTLASS MoE to work with editable install
+      - PYTHONPATH=/workspace/flashinfer
+      
       # vLLM PR branch for SM121/Blackwell support
       - VLLM_PR_NUMBER=31740
       - VLLM_REF=pr-31740

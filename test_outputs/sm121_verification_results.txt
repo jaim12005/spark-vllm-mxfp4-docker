@@ -1,0 +1,61 @@
+============================================================
+SM121 MXFP4 MoE GEMM + FA2 Attention Sinks Verification
+============================================================
+
+=== Environment Verification ===
+  ✓ PASS: CUDA Available
+         CUDA 13.1
+  ✓ PASS: GPU Detection
+         NVIDIA GB10 (SM121)
+  ✓ PASS: FlashInfer Import
+         Version: 0.5.3
+  ✓ PASS: Local FlashInfer in PYTHONPATH
+         Local FlashInfer detected
+
+  Environment Variables:
+    FLASHINFER_LOGLEVEL = 0
+    FLASHINFER_CUDA_ARCH_LIST = 12.1a
+
+=== Backend Summary ===
+  GPU: NVIDIA GB10
+  Compute Capability: SM121
+  FlashInfer Version: 0.5.3
+  CUDA Version: 13.1
+  Attention Backend: FA2
+  SM90a Support: False
+  MoE Backend: MXFP4 CUTLASS (available)
+  Attention Sinks: Available
+  Local FlashInfer Active: YES
+
+
+=== SM121 CUTLASS MoE GEMM Tests ===
+  ✓ PASS: MoE GEMM API Import
+         SM121 CUTLASS MoE module loaded successfully
+  ✓ PASS: SM121 CUTLASS MoE (decode, M=4)
+         BF16 MoE OK, Time: 1.808ms
+  ✓ PASS: SM121 CUTLASS MoE (decode, M=32)
+         BF16 MoE OK, Time: 3.680ms
+
+=== FA2 Attention Sink Tests ===
+  ✓ PASS: Attention Sink API Import
+         All attention sink APIs available
+  ✓ PASS: FA2 Attention Sink (fp16, B=1, S=128)
+         Shape OK, Time: 0.009ms
+  ✓ PASS: FA2 Attention Sink (bf16, B=1, S=128)
+         Shape OK, Time: 0.009ms
+  ✓ PASS: FA2 Attention Sink (fp16, B=4, S=256)
+         Shape OK, Time: 0.158ms
+  ✓ PASS: FA2 Attention Sink (bf16, B=4, S=256)
+         Shape OK, Time: 0.158ms
+  ✓ PASS: BatchAttentionWithAttentionSinkWrapper
+         Wrapper created successfully
+
+============================================================
+Test Summary
+============================================================
+  Passed: 13
+  Failed: 0
+
+Results saved to: test_outputs/verification_results.json
+
+✓ All tests passed!
