@@ -65,35 +65,45 @@ tokens (M×H) → TopK routing → [dispatch based on M]
 
 ## Implementation Plan
 
-### Phase 1: Standalone GEMV Kernel Wrapper (Week 1)
+### Phase 1: Standalone GEMV Kernel Wrapper (Week 1) ✅ IN PROGRESS
 
 **Goal**: Create a working FP4 GEMV kernel callable from Python
 
-**Files to create:**
+**Files created:**
 ```
 flashinfer/
 ├── csrc/
-│   └── gemv_blockscaled.cu          # CUDA kernel wrapper
+│   └── gemv/
+│       └── gemv_fp4_blockscaled.cu  # CUDA kernel wrapper ✅
 ├── flashinfer/
 │   └── gemv/
-│       ├── __init__.py
-│       └── fp4_gemv.py               # Python bindings
+│       ├── __init__.py              # Module exports ✅
+│       └── core.py                  # Python bindings ✅
+
+mxfp4/scripts/
+└── benchmark_cutlass_gemv.py        # Benchmark script ✅
 ```
 
 **Tasks:**
-1. [ ] Create JIT module for `GemvBlockScaled` kernel
-2. [ ] Define Python interface matching MoE weight format
-3. [ ] Handle MXFP4 weight layout (uint8 packed, scale factors)
-4. [ ] Write unit tests with known inputs
+1. [x] Create CUDA kernel wrapper using `GemvBlockScaled`
+2. [x] Define Python interface matching MoE weight format
+3. [x] Add heuristic for GEMV vs GEMM selection (`should_use_gemv_for_moe()`)
+4. [ ] Create JIT module for compilation
+5. [ ] Handle MXFP4 weight layout (uint8 packed, scale factors)
+6. [ ] Write unit tests with known inputs
 
-**Kernel signature:**
+**Kernel signature (implemented):**
 ```python
-def fp4_gemv(
-    input: torch.Tensor,           # [batch, hidden_dim] BF16 or FP8
-    weight: torch.Tensor,          # [out_dim, hidden_dim/2] uint8 (packed FP4)
-    weight_scale: torch.Tensor,    # [out_dim, hidden_dim/16] FP8 scale factors
-    output: torch.Tensor,          # [batch, out_dim] BF16
-) -> None:
+def gemv_fp4_blockscaled(
+    activations: torch.Tensor,       # [M, K] uint8 (packed FP4)
+    weights: torch.Tensor,           # [K, N] uint8 (packed FP4)
+    activation_scales: torch.Tensor, # FP8 scale factors
+    weight_scales: torch.Tensor,     # FP8 scale factors
+    output: Optional[torch.Tensor],  # [M, N] BF16
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
 ```
 
 ### Phase 2: MoE Integration (Week 2)
