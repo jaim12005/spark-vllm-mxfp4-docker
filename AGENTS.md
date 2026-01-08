@@ -295,6 +295,31 @@ The decode gap (29 vs 58 tok/s = **2x slower**) is the critical issue.
 
 ---
 
+## Callsite Logging (Proving Correct Dispatch)
+
+We added one-time callsite logging to vLLM to prove the correct MXFP4 path is used.
+
+**Expected log output on SM121:**
+```
+[MoE] backend=flashinfer format=MXFP4_NATIVE fn=flashinfer.fused_moe.cutlass_fused_moe
+[MoE] w13_weight dtype=torch.uint8 shape=(256, 8192, 2048)
+[MoE] w2_weight dtype=torch.uint8 shape=(256, 4096, 4096)
+[MoE] w13_weight_scale dtype=torch.float8_e4m3fn shape=(256, 8192, 64)
+[MoE] w2_weight_scale dtype=torch.float8_e4m3fn shape=(256, 4096, 128)
+[MoE] activation input dtype=torch.bfloat16 shape=(32, 4096) → MXFP8 quantized
+```
+
+**Red flags to watch for:**
+- `[MoE] WARNING: Using NVFP4 path` → Wrong quantization format
+- `format=MXFP4_BF16` on SM121 → Should be `MXFP4_NATIVE`
+- `quant_dtype=nvfp4` → Wrong path taken
+
+**Files modified:**
+- `vllm/model_executor/layers/quantization/mxfp4.py` (lines ~1007-1030)
+- `vllm/model_executor/layers/fused_moe/flashinfer_cutlass_moe.py` (FlashInferExperts.apply)
+
+---
+
 ## Testing Commands
 
 ```bash
