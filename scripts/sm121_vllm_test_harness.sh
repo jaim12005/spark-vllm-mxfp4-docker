@@ -457,13 +457,7 @@ start_vllm_server() {
     # Generation config override (from docker-compose.yml production)
     cmd+=(--override-generation-config '{"temperature":1.0,"top_p":1.0,"top_k":0}')
     
-    # Performance options
-    # Note: --enforce-eager is a boolean flag (present = True), not --flag=False style
-    # When VLLM_USE_CUDA_GRAPH=1 (default), we do NOT add --enforce-eager to allow CUDA graphs
-    # Only add --enforce-eager if explicitly disabled
-    if [[ "${VLLM_USE_CUDA_GRAPH:-1}" == "0" ]]; then
-        cmd+=(--enforce-eager)
-    fi
+    # CUDA graphs are enabled by default in vLLM - no flags needed
     
     # Async scheduling and prefix caching (from docker-compose)
     cmd+=(--async-scheduling)

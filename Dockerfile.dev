@@ -78,6 +78,9 @@ ENV VLLM_ATTENTION_BACKEND=FLASHINFER
 ENV VLLM_USE_CUDA_GRAPH=1
 ENV TORCH_CUDA_ARCH_LIST="12.1"
 
+# Tiktoken encodings path (for gpt-oss-120b tokenizer)
+ENV TIKTOKEN_ENCODINGS_BASE=/workspace/tiktoken_encodings
+
 # =============================================================================
 # System dependencies
 # =============================================================================
@@ -123,11 +126,11 @@ RUN --mount=type=cache,id=tiktoken-cache,target=/tiktoken-cache \
 
 
 # =============================================================================
-# llama-benchy installation (benchmarking tool)
+# Python packages (benchmarking tools, weight loading)
 # =============================================================================
 
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv pip install llama-benchy
+    uv pip install llama-benchy fastsafetensors
 
 # =============================================================================
 # Development entrypoint - DOES NOT TOUCH GIT BRANCHES

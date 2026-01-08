@@ -113,9 +113,20 @@ def bench_gpu_time_cupti(
     
     try:
         from flashinfer.testing import bench_gpu_time
-        return bench_gpu_time(fn, enable_cupti=True, num_iters=num_iterations, num_warmup=num_warmup)
-    except ImportError:
-        print("  Warning: CUPTI not available, falling back to CUDA events")
+        # FlashInfer API uses dry_run_iters/repeat_iters, not num_warmup/num_iters
+        result = bench_gpu_time(
+            fn, 
+            enable_cupti=True, 
+            dry_run_iters=num_warmup,
+            repeat_iters=num_iterations,
+        )
+        # bench_gpu_time returns (median_ms, std_ms) or just median_ms depending on version
+        if isinstance(result, tuple):
+            return result
+        else:
+            return result, 0.0
+    except (ImportError, TypeError) as e:
+        print(f"  Warning: CUPTI benchmark failed ({e}), falling back to CUDA events")
         return bench_gpu_time_cuda_events(fn, num_warmup, num_iterations)
 
 
@@ -151,94 +162,65 @@ def torch_profile_context(output_dir: Path, name: str):
 # =============================================================================
 
 def profile_moe_gemm_decode(config: ProfileConfig) -> List[ProfileResult]:
-    """Profile MoE GEMM performance in decode-like scenarios."""
+    """Profile MoE GEMM performance in decode-like scenarios using cutlass_fused_moe.
+    
+    Note: Uses cutlass_fused_moe (not trtllm_fp4_block_scale_moe) for SM121 compatibility.
+    """
     
     print("\n=== Profiling MoE GEMM (Decode) ===")
     
     try:
-        from flashinfer.fused_moe import (
-            trtllm_fp4_block_scale_moe,
-            trtllm_bf16_moe,
-            RoutingMethodType,
-            GatedActType,
-        )
-        has_moe = True
-    except ImportError:
-        print("  MoE GEMM not available")
+        from flashinfer.fused_moe import cutlass_fused_moe
+        from flashinfer.fused_moe.core import ActivationType
+    except ImportError as e:
+        print(f"  MoE GEMM not available: {e}")
         return []
     
     device = torch.device("cuda")
     results = []
     
+    # GPT-OSS-120B dimensions (must be divisible by 128 for MXFP4)
+    hidden_dim = 2944  # actual model dimension
+    intermediate_dim = 5888
+    num_experts = 128
+    topk = 8
+    
+    print(f"  Model dims: hidden={hidden_dim}, inter={intermediate_dim}, experts={num_experts}, topk={topk}")
+    
     for batch_size in config.batch_sizes:
         num_tokens = batch_size  # In decode, 1 token per request
-        hidden_dim = config.hidden_dim
-        intermediate_dim = 4 * hidden_dim
-        num_experts = config.num_experts
-        topk = config.topk
         
-        print(f"\n  Batch size: {batch_size}")
+        print(f"\n  Batch size (M): {batch_size}")
         
         # Create test data
-        routing_logits = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16, device=device)
         hidden_states = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=device)
         
-        # FP4 weights
-        gemm1_weights = torch.randint(
-            0, 256, 
-            (num_experts, 2 * intermediate_dim, hidden_dim // 2),
-            dtype=torch.uint8, device=device
-        )
-        gemm2_weights = torch.randint(
-            0, 256,
-            (num_experts, hidden_dim, intermediate_dim // 2),
-            dtype=torch.uint8, device=device
-        )
+        # Expert selection (random for benchmark)
+        topk_indices = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(num_tokens, topk, dtype=torch.float32, device=device) / topk
         
-        gemm1_scales = torch.ones(
-            num_experts, 2 * intermediate_dim, hidden_dim // 32,
-            dtype=torch.float8_e4m3fn, device=device
+        # BF16 weights (simplest path that works on SM121)
+        # Shapes match actual GPT-OSS-120B weights
+        fc1_weights = torch.randn(
+            num_experts, intermediate_dim, hidden_dim,
+            dtype=torch.bfloat16, device=device
         )
-        gemm2_scales = torch.ones(
-            num_experts, hidden_dim, intermediate_dim // 32,
-            dtype=torch.float8_e4m3fn, device=device
-        )
-        
-        hidden_states_scale = torch.ones(
-            num_tokens, hidden_dim // 32,
-            dtype=torch.float8_e4m3fn, device=device
+        fc2_weights = torch.randn(
+            num_experts, hidden_dim, intermediate_dim,
+            dtype=torch.bfloat16, device=device
         )
         
         def run_moe():
-            return trtllm_fp4_block_scale_moe(
-                routing_logits=routing_logits,
-                routing_bias=None,
-                hidden_states=hidden_states,
-                hidden_states_scale=hidden_states_scale,
-                gemm1_weights=gemm1_weights,
-                gemm1_weights_scale=gemm1_scales,
-                gemm1_bias=None,
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
-                gemm2_weights=gemm2_weights,
-                gemm2_weights_scale=gemm2_scales,
-                gemm2_bias=None,
-                output1_scale_scalar=None,
-                output1_scale_gate_scalar=None,
-                output2_scale_scalar=None,
-                num_experts=num_experts,
-                top_k=topk,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=intermediate_dim,
-                local_expert_offset=0,
-                local_num_experts=num_experts,
-                routed_scaling_factor=None,
-                routing_method_type=int(RoutingMethodType.Default),
-                do_finalize=True,
-                gated_act_type=int(GatedActType.SwiGlu),
-            )[0]
+            return cutlass_fused_moe(
+                input=hidden_states,
+                token_selected_experts=topk_indices,
+                token_final_scales=topk_weights,
+                fc1_expert_weights=fc1_weights,
+                fc2_expert_weights=fc2_weights,
+                output_dtype=torch.bfloat16,
+                quant_scales=[],  # Empty for BF16 path
+                activation_type=ActivationType.Gelu,
+            )
         
         try:
             if config.use_cupti:
@@ -246,7 +228,12 @@ def profile_moe_gemm_decode(config: ProfileConfig) -> List[ProfileResult]:
             else:
                 median_ms, std_ms = bench_gpu_time_cuda_events(run_moe, config.num_warmup, config.num_iterations)
             
-            print(f"    MXFP4 MoE GEMM: {median_ms:.3f} ± {std_ms:.3f} ms")
+            print(f"    MoE GEMM (BF16): {median_ms:.3f} ± {std_ms:.3f} ms")
+            
+            # Calculate decode impact (60 layers)
+            total_per_token = median_ms * 60
+            max_tok_s = 1000 / total_per_token if total_per_token > 0 else 0
+            print(f"    Per-token (60 layers): {total_per_token:.2f} ms → max {max_tok_s:.1f} tok/s")
             
             results.append(ProfileResult(
                 name=f"moe_gemm_decode_bs{batch_size}",
@@ -259,11 +246,15 @@ def profile_moe_gemm_decode(config: ProfileConfig) -> List[ProfileResult]:
                     "hidden_dim": hidden_dim,
                     "num_experts": num_experts,
                     "topk": topk,
+                    "total_per_token_ms": total_per_token,
+                    "max_tok_s": max_tok_s,
                 }
             ))
             
         except Exception as e:
             print(f"    Error: {e}")
+            import traceback
+            traceback.print_exc()
     
     return results
 
@@ -544,7 +535,7 @@ def analyze_results(
         {
             "category": "vLLM Runtime",
             "items": [
-                "Ensure --enforce-eager=False for CUDA graph support",
+                "CUDA graphs are enabled by default (no flags needed)",
                 "Tune --max-num-batched-tokens for your workload",
                 "Verify prefix caching is enabled if prompts share prefixes",
                 "Check --gpu-memory-utilization (higher = more KV cache)",

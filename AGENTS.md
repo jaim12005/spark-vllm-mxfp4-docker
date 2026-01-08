@@ -113,6 +113,11 @@ This is why you don't see "MXFP4" tile configs at the kernel level—they go thr
 
 ## Repository Layout
 
+**Host paths:**
+- **vLLM**: `~/projects/vllm`
+- **FlashInfer**: `~/projects/flashinfer`
+- **This repo (mxfp4)**: `~/projects/ai/mxfp4`
+
 ```
 ~/projects/
 ├── flashinfer/          # Local FlashInfer development (CUTLASS kernels)
@@ -317,20 +322,65 @@ wrapper = BatchDecodeWithPagedKVCacheWrapper(
 
 FlashInfer's namespace package structure requires explicit PYTHONPATH. Without it, Python may import from site-packages instead of the mounted local repo.
 
+### 5. Container recreation loses installed packages
+
+When the container is **recreated** (not just restarted), FlashInfer and vLLM need to be reinstalled because they're installed from mounted volumes. However, `fastsafetensors` and `llama-benchy` are baked into the Dockerfile.dev image.
+
+After `docker compose up -d`:
+
+```bash
+# Reinstall FlashInfer and vLLM from mounted repos
+cd /workspace/flashinfer && uv pip install --no-build-isolation -e .
+cd /workspace/vllm && python3 use_existing_torch.py && uv pip install -r requirements/build.txt && uv pip install --no-build-isolation -e .
+```
+
+**Note**: The Dockerfile.dev already includes `fastsafetensors`, `llama-benchy`, and tiktoken encodings.
+
+### 6. CUDA graphs crash with MXFP4 path (requires --enforce-eager)
+
+**Symptom**: Server crashes during "Capturing CUDA graphs" with `cudaErrorLaunchFailure`
+
+**Cause**: CUDA graph capture fails with the MXFP4/MXFP8 kernel path on SM121
+
+**Workaround**: Use `--enforce-eager` when starting the server
+
+**Impact**: Decode performance may be affected (no CUDA graph optimization). This is a priority issue to fix.
+
+### 7. Tiktoken encodings (baked into image)
+
+gpt-oss-120b requires tiktoken encodings. The Dockerfile.dev downloads and installs them at `/workspace/tiktoken_encodings` and sets `TIKTOKEN_ENCODINGS_BASE` automatically. If you see tiktoken errors, ensure you're using the updated Dockerfile.dev image.
+
+### 8. First-run JIT compilation takes ~3 minutes
+
+FlashInfer compiles MoE CUTLASS kernels on first use. This JIT compilation:
+- Takes **~3-5 minutes** on first server start
+- Caches to `/root/.cache/flashinfer/` for subsequent runs
+- May show zombie nvcc processes during compilation (normal)
+
+If startup stalls, check `ps aux | grep nvcc` to see if compilation is in progress.
+
+**Pre-warming the cache** (optional):
+```bash
+# Run after installing FlashInfer to avoid delay on first vLLM start
+docker exec vllm-dev python3 /workspace/scripts/warmup_jit_cache.py
+```
+
 ---
 
 ## Performance Targets (Scores to Beat)
 
-### Current State (after our work)
+### Current State (2026-01-08, enforce-eager mode)
 
 | Test | Throughput (t/s) | TTFR (ms) |
 |------|------------------|-----------|
-| pp2048 | 4808 ± 57 | 427 ± 5 |
-| tg32 | **29.26 ± 0.09** | - |
+| pp2048 | **4832 ± 35** | 425 ± 3 |
+| tg32 | **29.54 ± 0.04** | - |
 | pp2048 @ d512 | 3807 ± 19 | 673 ± 3 |
 | pp2048 @ d1024 | 4218 ± 35 | 729 ± 6 |
 | pp2048 @ d1536 | 4584 ± 14 | 783 ± 2 |
 | tg32 @ depths | ~29 t/s | - |
+
+**Note**: These results are with `--enforce-eager` (CUDA graphs disabled) due to a graph capture crash on SM121 with MXFP4 path.
 
 ### Targets to Beat
 
@@ -412,11 +462,84 @@ The decode gap (29 vs 58 tok/s = **2x slower**) is the critical issue.
 5. **KV cache access pattern** - Memory bandwidth during single-token decode
 6. **Quantization overhead** - BF16→FP8 conversion on every decode step?
 
-**Next step**: Profile decode-heavy workload (`nsys profile` or `torch.profiler`) to identify:
-- Top kernels by time during decode
-- CPU time between kernel launches
-- Whether CUDA graphs are being used
-- MoE vs Attention time split
+**Investigation findings (2026-01-08):**
+
+1. ~~**CUDA graphs crash during capture**~~ → **RESOLVED**: CUDA graphs now work on SM121 with MXFP4
+2. **CUDA graphs don't improve decode performance** (~28.7 tok/s with graphs vs ~29 tok/s without)
+   - Bottleneck is kernel execution time, not launch overhead
+3. **BF16 MoE kernel is very slow** for decode (M=1): ~2.3ms/call → 137ms/token (60 layers) → max 7.3 tok/s
+4. The **MXFP4 path must be faster** since vLLM achieves ~30 tok/s with it
+5. **Container recreation** loses all pip-installed packages
+
+**nsys Profiling Results (2026-01-08):**
+
+Captured ~52 decode tokens with nsys profiling. Top kernel breakdown:
+
+| Kernel | Time % | Total (s) | Instances | Avg (μs) |
+|--------|--------|-----------|-----------|----------|
+| GEMV (attn proj) | 31.8% | 1.88s | 12312 | 153 |
+| **CUTLASS MoE (FC1)** | 28.2% | 1.67s | 6300 | **266** |
+| GEMV (other) | 19.4% | 1.15s | 6331 | 181 |
+| **CUTLASS MoE (FC2)** | 12.3% | 0.73s | 6300 | **115** |
+| Activation (FP8) | 1.9% | 0.11s | 6300 | 18 |
+| Expand input rows | 1.9% | 0.11s | 6300 | 18 |
+
+**Key observations:**
+- **MoE kernels take 40.5%** of GPU time (FC1 + FC2)
+- Per-token MoE time: (266 + 115) μs × 60 layers ≈ **22.9ms**
+- Per-token GEMV time: 153μs × 237 calls ≈ **36ms**
+- Total kernel time per token: ~60ms → theoretical **16.7 tok/s**
+- Actual: 29 tok/s → overlap/parallelism helping
+
+**Bottleneck conclusion:**
+The **CUTLASS grouped GEMM** (MoE) is 40% of decode time. FC1 kernel (266μs) is 2.3x slower than FC2 (115μs) - likely due to SwiGLU fused activation. Attention GEMV is also significant.
+
+**Root cause analysis (2026-01-08):**
+
+**MoE-SPECIFIC LIMITATION DISCOVERED**: While CUTLASS supports M=64 tiles for block-scaled GEMM (see `87b_blackwell_geforce_*.cu`), the FlashInfer MoE kernel cannot use them due to scale factor layout constraints.
+
+**Why the MoE kernel is limited to M=128:**
+1. MoE uses `kSm12xBlockScaleGranularity = 128` (each scale covers 128 elements)
+2. TMA layout requires tile alignment with scale granularity
+3. When M=64 < 128, TMA fails: "CTA_Tile and SLayout top-level size equivalence"
+
+**Why CUTLASS example works with M=64:**
+The example uses `ScaleGranularityM = 1` (per-element scaling), which is completely different from MoE's 128-element blocks.
+
+**What would be needed to fix:**
+1. Change `kSm12xBlockScaleGranularity` from 128 to 64 or smaller
+2. Redesign scale factor packing in `sm12x_activation_quantizer.cuh`
+3. Change weight quantization format (scales per 64 elements)
+4. This is a significant architectural change, not just tile config
+
+**Impact for M=1 decode:**
+- 128×128 tile with 1 actual row → **0.78% compute efficiency**
+- This is a fundamental limitation, not a software bug
+
+**Attempted Solution (FAILED):**
+Tried adding M=64 tiles but got TMA layout errors. The MoE kernel's scale factor granularity (128 elements) makes smaller tiles incompatible.
+
+**Viable Alternative Solutions:**
+
+1. **Speculative decoding**: Generate multiple candidate tokens → M > 1
+   - vLLM has built-in support for speculative decoding
+   - Would naturally increase batch size for MoE
+
+2. **Token batching**: Accumulate decode tokens before MoE processing
+   - Requires scheduler changes in vLLM
+   - Trades latency for throughput
+
+3. **Reduce scale granularity**: Change `kSm12xBlockScaleGranularity` from 128 to 64
+   - Significant MoE kernel refactoring required
+   - Would need to change weight quantization format
+   - High effort, high reward
+
+**Why llama.cpp achieves 2x decode performance (58 vs 29 tok/s):**
+- Likely uses a different approach entirely:
+  - Custom GEMV kernel with on-the-fly dequantization
+  - Different scale factor layout (per-element or smaller groups)
+  - Not constrained by TMA block-scaled GEMM
+- Investigation of llama.cpp's CUDA backend would reveal their strategy
 
 ---
 
