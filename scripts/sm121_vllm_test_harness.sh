@@ -641,6 +641,24 @@ verify_backends() {
         echo "OK: MXFP4 BF16 MoE enabled" | tee -a "$summary_file"
     fi
     
+    # CRITICAL: Check for nvfp4 fallback errors in server logs
+    # If this message appears, MXFP4 path is broken and falling back to unsupported code
+    if [[ -f "$log_file" ]]; then
+        if grep -qiE "only supports nvfp4|nvfp4.*not.*support|not.*implement.*nvfp4" "$log_file" 2>/dev/null; then
+            echo "" | tee -a "$summary_file"
+            echo "FAIL: nvfp4 fallback error detected in server logs!" | tee -a "$summary_file"
+            echo "This indicates MXFP4 path is broken. Context:" | tee -a "$summary_file"
+            echo "---" | tee -a "$summary_file"
+            grep -iE -B 3 -A 3 "nvfp4" "$log_file" 2>/dev/null | head -30 | tee -a "$summary_file"
+            echo "---" | tee -a "$summary_file"
+            verification_passed=1
+        elif grep -qi "nvfp4" "$log_file" 2>/dev/null; then
+            # nvfp4 mentioned but not in an error context - just log it
+            echo "INFO: nvfp4 mentioned in logs (check context):" | tee -a "$summary_file"
+            grep -i "nvfp4" "$log_file" 2>/dev/null | head -5 | tee -a "$summary_file"
+        fi
+    fi
+    
     # Display the summary (|| true for belt-and-suspenders robustness)
     cat "$summary_file" || true
     
