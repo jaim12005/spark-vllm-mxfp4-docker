@@ -305,15 +305,49 @@ The software dequantization fallback is slow (as expected) because it:
 2. Has suboptimal memory access patterns
 3. Doesn't fuse operations
 
-**CUTLASS GemvBlockScaled Integration Attempt ❌**
+**CUTLASS GemvBlockScaled Integration (2026-01-08) ✅ Works but slow**
 
-Attempted to integrate the native CUTLASS `GemvBlockScaled` kernel but encountered:
-1. Namespace conflicts between `cute::Tensor` and other Tensor types
-2. Complex epilogue interface requirements (expects FP4 output by default)
-3. Template parameter matching challenges
+Successfully integrated the CUTLASS `GemvBlockScaled` kernel:
 
-The CUTLASS GEMV integration requires more invasive changes to the CUTLASS includes
-and is deferred.
+**Files created:**
+- `csrc/gemv/gemv_cutlass_standalone.cu` - Standalone CUTLASS wrapper
+- Compiled to `/tmp/libgemv_cutlass.so` for testing
+
+**Key fixes:**
+1. Include `cute/tensor.hpp` FIRST to avoid namespace conflicts
+2. Use non-const TensorRef for A (CUTLASS requirement)
+3. Compile with `-DCUTLASS_ARCH_MMA_SM100_SUPPORTED`
+
+**Benchmark Results (gpt-oss-120b dimensions: M=5888, K=2944):**
+```
+Raw CUTLASS GEMV:        0.37 ms per call
+CUTLASS GEMV + BF16 convert: 0.59 ms per call
+Batched GEMV (8 experts): 2.58 ms per call (0.32 ms/expert)
+
+Estimated MoE throughput: 2.8-3.2 tok/s (WORSE than 29 tok/s baseline!)
+```
+
+**DP4A-based GEMV (llama.cpp inspired):**
+```
+DP4A GEMV: 0.43 ms per call
+Estimated MoE throughput: 2.4 tok/s
+```
+
+**Why GEMV is slower than grouped GEMM:**
+
+The fundamental issue is that GEMV cannot batch efficiently across experts:
+
+| Approach | Kernel Launches/Token | Time | Throughput |
+|----------|----------------------|------|------------|
+| Grouped GEMM (current) | 120 (60 layers × 2) | ~34ms | 29 tok/s |
+| GEMV (sequential) | 960 (8 experts × 60 layers × 2) | ~350ms | 2.8 tok/s |
+| GEMV (batched by expert) | 120 | ~309ms | 3.2 tok/s |
+
+**Root cause:**
+- Grouped GEMM processes all experts in ONE kernel with memory reuse
+- GEMV must call separately per expert (or batch with overhead)
+- GEMV is memory-bound: 8.7 MB weight read per call
+- Theoretical memory time: 0.025ms, actual: 0.37ms (14× overhead)
 
 **Speculative Decoding Test (2026-01-08)**
 
@@ -334,34 +368,55 @@ Other speculative methods (suffix, eagle, draft model) may work better but requi
 
 ### Key Findings
 
-1. **CUTLASS GemvBlockScaled** is the right primitive but integration is complex
-2. **Ngram speculation** doesn't help for open-ended generation
-3. **Current bottleneck** remains the 128×128 tile inefficiency at M=1
+1. **CUTLASS GemvBlockScaled works** but is slower than grouped GEMM for MoE
+2. **DP4A-based GEMV** is also slower due to per-expert overhead
+3. **Ngram speculation** doesn't help for open-ended generation
+4. **The grouped GEMM approach is correct** - the bottleneck is tile efficiency, not kernel choice
+5. **llama.cpp's advantage** likely comes from different model architecture or quantization format
 
-### Next: Phase 2 - Alternative Approaches
+### Critical Insight: Why GEMV Can't Beat Grouped GEMM
 
-**Option A: Continue CUTLASS GEMV Integration**
-- Fix namespace conflicts by isolating CUTLASS includes
-- Create proper custom epilogue matching kernel expectations
-- Time estimate: 1-2 weeks
+The MoE grouped GEMM processes **all experts for all tokens in one kernel**:
+- Reads each weight matrix once
+- Reuses input activations across experts
+- Single kernel launch overhead
 
-**Option B: Custom CUDA GEMV Kernel**
-- Write a hand-tuned GEMV without CUTLASS complexity
-- More control but more work
-- Time estimate: 2-3 weeks
+GEMV must process experts separately:
+- 8× more kernel launches (or batched with strided access)
+- No weight sharing across experts
+- Memory bandwidth limited
 
-**Option C: Draft Model Speculation**
-- Use a small draft model for speculative decoding
-- Better for open-ended generation than ngram
-- Time estimate: 1 week (if draft model available)
+**The 128×128 tile "waste" is less costly than the GEMV overhead.**
 
-**Recommendation:** Try Option C (draft model speculation) first as it's lowest effort.
-If insufficient, pursue Option A (CUTLASS GEMV integration).
+### Remaining Viable Options
 
-### Remaining Work
+1. **Speculative decoding with draft model**
+   - Increases effective batch size to M=4-8
+   - Makes 128×128 tiles more efficient (6-12% vs 0.78%)
+   - Requires compatible draft model
 
-1. **Try draft model speculation** with a small compatible model
-2. **If insufficient**: Continue CUTLASS GemvBlockScaled integration
-3. **Phase 3**: Add dispatch logic in FlashInfer MoE pipeline
-4. **Phase 4**: Benchmark and optimize to match llama.cpp (~58 tok/s)
+2. **Continuous batching optimization**
+   - Wait for more concurrent requests
+   - Batch tokens across requests
+   - Trades latency for throughput
+
+3. **llama.cpp integration study**
+   - Understand their exact approach
+   - May involve different model loading/quantization
+   - See `docs/LLAMA_CPP_GEMV_ANALYSIS.md`
+
+### Conclusion
+
+**GEMV is NOT the solution for MoE decode optimization on SM121.**
+
+The grouped GEMM approach with 128×128 tiles, despite the compute waste, has lower
+total latency than GEMV alternatives due to:
+- Better memory bandwidth utilization (one read per weight matrix)
+- Single kernel launch overhead
+- Efficient expert batching
+
+Focus efforts on:
+1. **Speculative decoding** to increase M
+2. **Continuous batching** to increase concurrent tokens
+3. **Understanding llama.cpp** if they truly achieve 2× performance
 
