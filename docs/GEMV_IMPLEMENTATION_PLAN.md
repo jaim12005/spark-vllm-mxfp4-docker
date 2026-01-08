@@ -287,6 +287,7 @@ Created the following files in FlashInfer:
 - `flashinfer/gemv/core.py` - Python interface with `should_use_gemv_for_moe()` heuristic
 - `flashinfer/jit/gemv.py` - JIT compilation spec
 - `csrc/gemv/gemv_fp4_blockscaled.cu` - CUDA kernel with software dequant fallback
+- `csrc/gemv/gemv_epilogue_bf16.h` - Custom epilogue for BF16 output
 
 Created in mxfp4:
 - `scripts/benchmark_cutlass_gemv.py` - Benchmark script
@@ -304,29 +305,63 @@ The software dequantization fallback is slow (as expected) because it:
 2. Has suboptimal memory access patterns
 3. Doesn't fuse operations
 
-### Next: Phase 2 - CUTLASS GemvBlockScaled Integration
+**CUTLASS GemvBlockScaled Integration Attempt ❌**
 
-**Key findings from CUTLASS analysis:**
+Attempted to integrate the native CUTLASS `GemvBlockScaled` kernel but encountered:
+1. Namespace conflicts between `cute::Tensor` and other Tensor types
+2. Complex epilogue interface requirements (expects FP4 output by default)
+3. Template parameter matching challenges
 
-1. **GemvBlockScaled requirements:**
-   - `kElementsPerAccess = 32` (hardcoded for FP4)
-   - `kSFVecSize = 16` (hardcoded)
-   - Both A and B must be FP4 (e2m1)
-   - Scale factors must be FP8 (e4m3)
+The CUTLASS GEMV integration requires more invasive changes to the CUTLASS includes
+and is deferred.
 
-2. **Integration challenge:**
-   - MXFP4 activations come as BF16 and need quantization
-   - Scale factor layout must match MXFP4 format
-   - Custom epilogue needed for BF16 output
+**Speculative Decoding Test (2026-01-08)**
 
-3. **Approach:**
-   - Use existing `mxfp4_quantize()` for BF16→FP4 conversion
-   - Instantiate GemvBlockScaled with proper epilogue
-   - Handle batching over experts
+Tested ngram speculative decoding as an alternative approach:
+
+```bash
+vllm serve ... --speculative-config.method=ngram \
+    --speculative-config.num_speculative_tokens=4 \
+    --speculative-config.prompt_lookup_max=5
+```
+
+**Results:**
+- Open-ended generation: ~17-20 tok/s (WORSE than baseline ~29 tok/s)
+- Reason: Ngram speculation requires repetitive patterns in output that match the prompt
+
+**Conclusion:** Ngram speculation is NOT suitable for gpt-oss-120b's use case (open-ended generation).
+Other speculative methods (suffix, eagle, draft model) may work better but require additional setup.
+
+### Key Findings
+
+1. **CUTLASS GemvBlockScaled** is the right primitive but integration is complex
+2. **Ngram speculation** doesn't help for open-ended generation
+3. **Current bottleneck** remains the 128×128 tile inefficiency at M=1
+
+### Next: Phase 2 - Alternative Approaches
+
+**Option A: Continue CUTLASS GEMV Integration**
+- Fix namespace conflicts by isolating CUTLASS includes
+- Create proper custom epilogue matching kernel expectations
+- Time estimate: 1-2 weeks
+
+**Option B: Custom CUDA GEMV Kernel**
+- Write a hand-tuned GEMV without CUTLASS complexity
+- More control but more work
+- Time estimate: 2-3 weeks
+
+**Option C: Draft Model Speculation**
+- Use a small draft model for speculative decoding
+- Better for open-ended generation than ngram
+- Time estimate: 1 week (if draft model available)
+
+**Recommendation:** Try Option C (draft model speculation) first as it's lowest effort.
+If insufficient, pursue Option A (CUTLASS GEMV integration).
 
 ### Remaining Work
 
-1. **Phase 2**: Integrate CUTLASS GemvBlockScaled native kernel
-2. **Phase 3**: Add dispatch logic in FlashInfer MoE pipeline
-3. **Phase 4**: Benchmark and optimize to match llama.cpp (~58 tok/s)
+1. **Try draft model speculation** with a small compatible model
+2. **If insufficient**: Continue CUTLASS GemvBlockScaled integration
+3. **Phase 3**: Add dispatch logic in FlashInfer MoE pipeline
+4. **Phase 4**: Benchmark and optimize to match llama.cpp (~58 tok/s)
 

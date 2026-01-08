@@ -543,6 +543,70 @@ Tried adding M=64 tiles but got TMA layout errors. The MoE kernel's scale factor
 
 ---
 
+## Speculative Decoding Investigation (2026-01-08)
+
+### Ngram Speculation Results
+
+Tested vLLM's built-in ngram speculative decoding:
+
+```bash
+vllm serve ... \
+    --speculative-config.method=ngram \
+    --speculative-config.num_speculative_tokens=4 \
+    --speculative-config.prompt_lookup_max=5 \
+    --speculative-config.prompt_lookup_min=1
+```
+
+**Results:**
+| Prompt Type | Throughput | Baseline |
+|-------------|------------|----------|
+| Open-ended generation | ~17-20 tok/s | 29 tok/s |
+| Repetitive patterns | Server crash | 29 tok/s |
+
+**Conclusion:** Ngram speculation is **NOT suitable** for gpt-oss-120b because:
+1. Open-ended generation rarely repeats patterns from the prompt
+2. Speculation overhead exceeds benefits when speculation fails
+3. Async scheduling not supported with ngram (falls back to sync)
+
+### Alternative Approaches (Not Yet Tested)
+
+1. **Draft model speculation** - Uses a smaller model for drafting
+   - Better for open-ended generation
+   - Requires a compatible draft model
+
+2. **Suffix decoding** - Uses global response cache
+   - Better for structured outputs (JSON, code)
+   - `--speculative-config.method=suffix`
+
+3. **EAGLE/MTP** - Model-specific speculation heads
+   - Highest acceptance rate
+   - Requires model-specific training
+
+### GEMV Fallback Status
+
+Created infrastructure for GEMV-based decode optimization:
+- `flashinfer/gemv/` - Python module with heuristic
+- `csrc/gemv/gemv_fp4_blockscaled.cu` - CUDA kernel (software fallback)
+- `csrc/gemv/gemv_epilogue_bf16.h` - Custom epilogue for BF16 output
+
+**Benchmark (software dequant fallback):**
+```
+GEMV: ~0.46 ms per call → ~7.2 tok/s (too slow)
+```
+
+Native CUTLASS `GemvBlockScaled` integration deferred due to:
+- Namespace conflicts in CUTLASS headers
+- Complex custom epilogue requirements
+- Template parameter matching challenges
+
+### Recommended Next Steps
+
+1. **Try draft model speculation** with a small compatible model
+2. **Investigate llama.cpp's decode kernel** for their GEMV approach
+3. **Consider custom CUDA kernel** if CUTLASS integration remains difficult
+
+---
+
 ## Callsite Logging (Proving Correct Dispatch)
 
 We added one-time callsite logging to vLLM to prove the correct MXFP4 path is used.
