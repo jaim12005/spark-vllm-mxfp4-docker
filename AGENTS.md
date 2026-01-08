@@ -138,27 +138,152 @@ This is why you don't see "MXFP4" tile configs at the kernel level—they go thr
 
 ---
 
-## Docker Environment
+## Docker Environment (Dev Container)
 
-The `vllm-dev` container mounts local repos:
+### How It Works
+
+The dev container (`vllm-dev`) mounts your local FlashInfer and vLLM repos as volumes. This allows:
+
+1. **Live code editing** - Changes to kernel code on your host are immediately visible in the container
+2. **JIT recompilation** - FlashInfer's JIT system detects file changes and recompiles kernels
+3. **No reinstall needed** - Edit `.cuh` files on host → run in container → changes take effect
+
+### Volume Mounts
 
 ```yaml
+# docker-compose.dev.yml
 volumes:
-  - ~/projects/flashinfer:/workspace/flashinfer
+  # Source code - your local repos become /workspace/* in container
   - ~/projects/vllm:/workspace/vllm
-
-environment:
-  - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
-  - VLLM_ATTENTION_BACKEND=FLASHINFER
-  - VLLM_USE_FLASHINFER_MOE_MXFP4_BF16=1
-  - VLLM_USE_CUDA_GRAPH=1
+  - ~/projects/flashinfer:/workspace/flashinfer
+  
+  # Persistent caches - survive container restarts
+  - ~/.cache/huggingface:/root/.cache/huggingface    # Model weights
+  - ./.cache/flashinfer:/root/.cache/flashinfer      # JIT compiled kernels
+  - ./.cache/vllm:/root/.cache/vllm                  # vLLM caches
+  - ./.cache/torch:/root/.cache/torch                # PyTorch caches
 ```
 
-**Always verify you're using local FlashInfer:**
+**Important**: The cache mounts are relative to the docker-compose directory (`~/projects/ai/mxfp4/.cache/`).
+
+### PYTHONPATH: Why It's Required
+
+FlashInfer uses Python's namespace package mechanism. When you have both:
+- An installed wheel (`/usr/local/lib/python3.12/site-packages/flashinfer/`)
+- A local repo mount (`/workspace/flashinfer/`)
+
+Python may prefer the installed wheel! Setting `PYTHONPATH` forces the local mount to take precedence:
+
+```yaml
+environment:
+  - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
+```
+
+The `${PYTHONPATH:+:$PYTHONPATH}` suffix preserves any existing PYTHONPATH from the base image.
+
+### Quick Verification Commands
+
 ```bash
+# 1. Check you're using the local FlashInfer (CRITICAL)
 docker exec vllm-dev python3 -c "import flashinfer; print(flashinfer.__file__)"
-# Should print: /workspace/flashinfer/flashinfer/__init__.py
-# NOT: /usr/local/lib/python3.x/site-packages/flashinfer/...
+# ✓ Should print: /workspace/flashinfer/flashinfer/__init__.py
+# ❌ NOT: /usr/local/lib/python3.x/site-packages/flashinfer/...
+
+# 2. Check you're using the local vLLM
+docker exec vllm-dev python3 -c "import vllm; print(vllm.__file__)"
+# ✓ Should print: /workspace/vllm/vllm/__init__.py
+
+# 3. Check both imports at once
+docker exec -e PYTHONPATH=/workspace/flashinfer:/workspace/vllm vllm-dev \
+  python3 -c "import flashinfer, vllm; print('flashinfer:', flashinfer.__file__); print('vllm:', vllm.__file__)"
+```
+
+### Two Services: `dev` vs `serve`
+
+| Service | Purpose | Command |
+|---------|---------|---------|
+| `dev` | Interactive development | `docker compose -f docker-compose.dev.yml up -d` then `docker exec -it vllm-dev bash` |
+| `serve` | Run vLLM server | `docker compose -f docker-compose.dev.yml --profile serve up serve` |
+
+The `serve` service has the full `vllm serve` command pre-configured with MXFP4 settings.
+
+### Workflow: Editing Kernels
+
+1. **Edit kernel on host**: `vim ~/projects/flashinfer/include/flashinfer/moe/...`
+2. **Clear JIT cache** (if needed): `docker exec vllm-dev rm -rf /root/.cache/flashinfer/`
+3. **Run your test/server**: FlashInfer JIT detects changes and recompiles
+4. **No container restart needed**
+
+### Workflow: Editing Python Code
+
+Python changes are immediate (no JIT involved):
+
+1. **Edit Python on host**: `vim ~/projects/flashinfer/flashinfer/fused_moe/core.py`
+2. **Run your test/server**: Changes take effect immediately
+
+### Common Issues
+
+**Issue: "Using wrong FlashInfer"**
+```
+# You see site-packages path instead of /workspace
+import flashinfer
+print(flashinfer.__file__)  # /usr/local/.../site-packages/flashinfer/__init__.py
+```
+
+**Fix**: Ensure PYTHONPATH is set correctly:
+```bash
+# Option A: Pass explicitly
+docker exec -e PYTHONPATH=/workspace/flashinfer:/workspace/vllm vllm-dev python3 ...
+
+# Option B: Use shell in container (inherits env from compose)
+docker exec -it vllm-dev bash
+python3 ...
+```
+
+**Issue: "Old kernel code running"**
+
+FlashInfer caches compiled kernels. If you change `.cuh` files but see old behavior:
+
+```bash
+# Clear the JIT cache
+docker exec vllm-dev rm -rf /root/.cache/flashinfer/
+# Or from host:
+rm -rf ~/projects/ai/mxfp4/.cache/flashinfer/
+```
+
+**Issue: "Container can't see my changes"**
+
+Verify the volume mount is working:
+```bash
+# Create a test file on host
+echo "test" > ~/projects/flashinfer/TEST_FILE
+
+# Check it's visible in container
+docker exec vllm-dev cat /workspace/flashinfer/TEST_FILE
+```
+
+### Environment Variables (Full List)
+
+```yaml
+environment:
+  # Python path (CRITICAL for local repos)
+  - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
+  
+  # MXFP4 backend selection
+  - VLLM_USE_FLASHINFER_MOE_MXFP4_BF16=1
+  - VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=0
+  - VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=0
+  - VLLM_FLASHINFER_MOE_BACKEND=throughput
+  - VLLM_USE_FLASHINFER_MOE_FP4=1
+  
+  # Performance settings
+  - VLLM_ATTENTION_BACKEND=FLASHINFER    # Use FlashInfer for attention
+  - VLLM_USE_CUDA_GRAPH=1                 # Enable CUDA graphs
+  - FLASHINFER_NVCC_THREADS=4             # Parallel JIT compilation
+  
+  # Debugging (set to 1 to enable)
+  - FLASHINFER_LOGLEVEL=0                 # 0=off, 1=basic, 3=detailed, 5=stats
+  - FLASHINFER_JIT_VERBOSE=0              # Show JIT compilation output
 ```
 
 ---
