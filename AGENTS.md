@@ -196,29 +196,35 @@ FlashInfer's namespace package structure requires explicit PYTHONPATH. Without i
 
 ## Performance Targets (Scores to Beat)
 
-### The Problem: vLLM wins prefill but loses decode
+### Current State (after our work)
 
-| Depth | llama.cpp pp | vLLM pp | llama.cpp tg | vLLM tg | SGLang tg |
-|-------|--------------|---------|--------------|---------|-----------|
-| 0 | 2449.83 | **4663.70** ✓ | **57.85** | 33.55 ❌ | ~52 |
-| 4096 | 2293.59 | **3172.51** ✓ | **54.81** | 32.63 ❌ | - |
-| 8192 | 2147.98 | **2687.84** ✓ | **52.14** | 31.50 ❌ | - |
-| 16384 | 1845.71 | **2044.47** ✓ | **48.53** | 29.55 ❌ | - |
-| 32768 | 1404.70 | 1398.80 | **41.72** | 26.65 ❌ | - |
+| Test | Throughput (t/s) | TTFR (ms) |
+|------|------------------|-----------|
+| pp2048 | 4808 ± 57 | 427 ± 5 |
+| tg32 | **29.26 ± 0.09** | - |
+| pp2048 @ d512 | 3807 ± 19 | 673 ± 3 |
+| pp2048 @ d1024 | 4218 ± 35 | 729 ± 6 |
+| pp2048 @ d1536 | 4584 ± 14 | 783 ± 2 |
+| tg32 @ depths | ~29 t/s | - |
 
-**Key insight**: vLLM is ~2x better on prefill, but ~40% slower on decode.
+### Targets to Beat
 
-### Targets
+| Engine | pp2048 (t/s) | tg32 (t/s) |
+|--------|--------------|------------|
+| **llama.cpp** | 2449.83 | **57.85** |
+| **SGLang** | - | **~52** |
+| **Our vLLM** | **4808** ✓ | 29.26 ❌ |
 
-| Metric | Current (vLLM) | Target | Gap |
-|--------|----------------|--------|-----|
-| **tg32 @ d0** | 33.55 t/s | ≥52 t/s | +55% needed |
-| **tg32 @ d4096** | 32.63 t/s | ≥47 t/s | +44% needed |
-| **tg32 @ d8192** | 31.50 t/s | ≥41 t/s | +30% needed |
-| **tg32 @ d16384** | 29.55 t/s | ≥34 t/s | +15% needed |
-| **tg32 @ d32768** | 26.65 t/s | ≥26 t/s | ✓ (parity) |
+### The Problem: Decode is 2x slower than competition
 
-At longer contexts (32k), vLLM catches up. The decode gap narrows with depth.
+| Metric | Current | Target | Gap |
+|--------|---------|--------|-----|
+| **tg32** | 29.26 t/s | ≥52 t/s | **+78% needed** |
+| **pp2048** | 4808 t/s | 2449 t/s | ✓ (2x better) |
+
+**Prefill is excellent** - almost 2x llama.cpp. No work needed there.
+
+**Decode is the blocker** - we need to nearly double decode throughput.
 
 ### SGLang Reference (single prompt)
 
@@ -270,15 +276,22 @@ openai/gpt-oss-120b   tg32 @ d32768      26.65±0.01
 
 ### Decode Bottleneck Analysis
 
-The decode gap (33 vs 58 tok/s) suggests:
+The decode gap (29 vs 58 tok/s = **2x slower**) is the critical issue.
 
-1. **MoE routing overhead?** - Per-token expert selection has fixed cost
-2. **Attention decode kernel?** - FA2 decode path efficiency on SM121
-3. **Python/IPC overhead?** - vLLM's scheduler, ZMQ, async engine
-4. **CUDA graph effectiveness?** - Are graphs actually being used for decode?
-5. **KV cache access pattern?** - Memory bandwidth during decode
+**Possible causes (need profiling to confirm):**
 
-**Priority**: Profile decode-heavy workload to identify top kernels and CPU time.
+1. **MoE routing overhead** - Per-token expert selection has fixed cost that doesn't amortize in decode
+2. **FA2 decode kernel efficiency** - Is the SM121 decode kernel optimized?
+3. **Python/IPC overhead** - vLLM's scheduler, ZMQ, async engine between tokens
+4. **CUDA graph effectiveness** - Are graphs actually capturing decode iterations?
+5. **KV cache access pattern** - Memory bandwidth during single-token decode
+6. **Quantization overhead** - BF16→FP8 conversion on every decode step?
+
+**Next step**: Profile decode-heavy workload (`nsys profile` or `torch.profiler`) to identify:
+- Top kernels by time during decode
+- CPU time between kernel launches
+- Whether CUDA graphs are being used
+- MoE vs Attention time split
 
 ---
 
