@@ -1,0 +1,33 @@
+diff --git a/vllm/compilation/decorators.py b/vllm/compilation/decorators.py
+--- a/vllm/compilation/decorators.py
++++ b/vllm/compilation/decorators.py
+@@ -316,7 +316,7 @@ class VllmBackend:
+             # here we toggle it only if it is set to True, so that after we
+             # leave the _inductor scope, the value is restored.
+             # the logic should cover both case, if it is set to True/False.
+-                if is_torch_equal_or_newer("2.10.0.dev"):
++                if is_torch_equal_or_newer("2.10.0.dev") and hasattr(torch._inductor.config, "assume_32bit_indexing"):
+                     assume_32bit = torch._inductor.config.assume_32bit_indexing
+                     if not assume_32bit:
+                         torch._inductor.config.assume_32bit_indexing = True
+@@ -356,7 +356,7 @@ class VllmBackend:
+                 else:
+                     assume_32bit = True
+                     old_assume_32bit = True
+-                    if is_torch_equal_or_newer("2.10.0.dev"):
++                    if is_torch_equal_or_newer("2.10.0.dev") and hasattr(torch._inductor.config, "assume_32bit_indexing"):
+                         assume_32bit = torch._inductor.config.assume_32bit_indexing
+                         old_assume_32bit = assume_32bit
+                         if not assume_32bit:
+@@ -498,7 +498,8 @@ class VllmBackend:
+         # Prepare inductor config patches
+         # assume_32bit_indexing is only available in torch 2.10.0.dev+
+         inductor_config_patches = {}
+-        if is_torch_equal_or_newer("2.10.0.dev"):
++        # NGC containers may have alpha versions without this config
++        if is_torch_equal_or_newer("2.10.0.dev") and hasattr(torch._inductor.config, "assume_32bit_indexing"):
+             inductor_config_patches["assume_32bit_indexing"] = True
+ 
+         with (
+
+

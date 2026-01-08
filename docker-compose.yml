@@ -1,0 +1,105 @@
+# =============================================================================
+# Docker Compose for GPT-OSS-120B with MXFP4 on DGX Spark
+# =============================================================================
+#
+# Usage:
+#   docker compose up -d              # Start the service
+#   docker compose logs -f            # View logs
+#   docker compose down               # Stop the service
+#
+# =============================================================================
+
+services:
+  vllm-mxfp4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vllm-dgx-spark-mxfp4:latest
+    container_name: vllm-mxfp4
+    restart: no
+    
+    # GPU access
+    gpus: all
+    
+    # Port mapping for vLLM API
+    ports:
+      - "8000:8000"
+    
+    # Shared memory - use host IPC namespace
+    ipc: host
+    
+    # Resource limits for GPU memory operations
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    
+    # Persistent volumes - mount host directories for cache persistence
+    volumes:
+      # HuggingFace model cache
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      # vLLM cache
+      - ./.cache/vllm:/root/.cache/vllm
+      # PyTorch cache
+      - ./.cache/torch:/root/.cache/torch
+      # Triton cache
+      - ./.cache/triton:/root/.cache/triton
+      # FlashInfer JIT cache
+      - ./.cache/flashinfer:/root/.cache/flashinfer
+      # UV package cache
+      - ./.cache/uv:/root/.cache/uv
+      # Ccache for C++/CUDA compilation
+      - ./.cache/ccache:/root/.ccache
+    
+    # Environment variables
+    environment:
+      # MXFP4 configuration
+      - VLLM_USE_FLASHINFER_MOE_MXFP4_BF16=1
+      - VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=0
+      - VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=0
+      - VLLM_FLASHINFER_MOE_BACKEND=throughput
+      - VLLM_USE_FLASHINFER_MOE_FP4=1
+      
+      # Performance tuning
+      - VLLM_ATTENTION_BACKEND=FLASHINFER
+      - VLLM_USE_CUDA_GRAPH=1
+      - FLASHINFER_NVCC_THREADS=4
+      
+      # Logging (set to 1 or 3 for debugging)
+      - FLASHINFER_LOGLEVEL=0
+      - FLASHINFER_JIT_VERBOSE=0
+      
+      # Tiktoken encodings for tokenizer
+      - TIKTOKEN_ENCODINGS_BASE=/workspace/tiktoken_encodings
+      
+      # HuggingFace token (optional, for gated models)
+      # - HF_TOKEN=${HF_TOKEN}
+    
+    # Serve GPT-OSS-120B with MXFP4 quantization
+    command: >
+      vllm serve openai/gpt-oss-120b
+        --host 0.0.0.0
+        --port 8000
+        --served-model-name gpt-oss-120b
+        --quantization mxfp4
+        --tensor-parallel-size 1
+        --override-generation-config '{"temperature":1.0,"top_p":1.0,"top_k":0}'
+        --enable-auto-tool-choice
+        --tool-call-parser=openai
+        --reasoning-parser=openai_gptoss
+        --gpu-memory-utilization 0.70
+        --max-model-len 131072
+        --max-num-seqs 2
+        --max-num-batched-tokens 8192
+        --async-scheduling
+        --enable-prefix-caching
+        --load-format fastsafetensors
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s  # 5 minutes for model loading
+
+# Note: Using bind mounts instead of named volumes for easier access to cached data

@@ -1,0 +1,256 @@
+# =============================================================================
+# Dockerfile.dev - Development Image for vLLM + FlashInfer on DGX Spark
+# =============================================================================
+#
+# This is a DEVELOPMENT image that expects vLLM and FlashInfer to be mounted
+# at runtime. This enables rapid iteration without rebuilding the image.
+#
+# IMPORTANT: This image does NOT manage git branches. You are responsible for
+# checking out the correct branches in your mounted repos before starting.
+#
+# Build:
+#   docker build -f Dockerfile.dev -t vllm-dev .
+#
+# Run (see docker-compose.dev.yml for easier usage):
+#   docker run --gpus all -it \
+#     -v ~/projects/vllm:/workspace/vllm \
+#     -v ~/projects/flashinfer:/workspace/flashinfer \
+#     vllm-dev
+#
+# =============================================================================
+
+FROM nvcr.io/nvidia/pytorch:25.12-py3
+
+LABEL maintainer="DGX Spark Development"
+LABEL description="Development image for vLLM + FlashInfer iteration"
+
+# =============================================================================
+# Build arguments
+# =============================================================================
+
+# NOTE: CUTLASS kernel instantiations are very memory-hungry (5-10GB each).
+# With BUILD_JOBS=16, peak memory can exceed 100GB, causing OOM kills.
+# Use BUILD_JOBS=4 for fused MoE kernels, or set MAX_JOBS=4 at runtime.
+ARG BUILD_JOBS=4
+
+# =============================================================================
+# Build parallelism controls (conservative for ARM)
+# =============================================================================
+
+ENV MAX_JOBS=${BUILD_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
+ENV NINJAFLAGS="-j${BUILD_JOBS}"
+ENV MAKEFLAGS="-j${BUILD_JOBS}"
+
+# =============================================================================
+# Environment setup
+# =============================================================================
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# UV package manager
+ENV UV_SYSTEM_PYTHON=1
+ENV UV_BREAK_SYSTEM_PACKAGES=1
+ENV UV_LINK_MODE=copy
+ENV UV_CACHE_DIR=/root/.cache/uv
+
+# Ccache for C++/CUDA
+ENV PATH=/usr/lib/ccache:$PATH
+ENV CCACHE_DIR=/root/.ccache
+ENV CCACHE_MAXSIZE=50G
+ENV CCACHE_COMPRESS=1
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+# FlashInfer - CRITICAL: 12.1a enables hardware FP4 path
+ENV FLASHINFER_CUDA_ARCH_LIST="12.1a"
+ENV FLASHINFER_JIT_VERBOSE=0
+ENV FLASHINFER_LOGLEVEL=0
+ENV FLASHINFER_NVCC_THREADS=4
+
+# vLLM MXFP4 configuration
+ENV VLLM_USE_FLASHINFER_MOE_MXFP4_BF16=1
+ENV VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=0
+ENV VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=0
+ENV VLLM_FLASHINFER_MOE_BACKEND=throughput
+ENV VLLM_USE_FLASHINFER_MOE_FP4=1
+ENV VLLM_ATTENTION_BACKEND=FLASHINFER
+ENV VLLM_USE_CUDA_GRAPH=1
+ENV TORCH_CUDA_ARCH_LIST="12.1"
+
+# =============================================================================
+# System dependencies
+# =============================================================================
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    vim \
+    htop \
+    ninja-build \
+    ccache \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install uv
+
+# =============================================================================
+# Workspace setup
+# =============================================================================
+
+WORKDIR /workspace
+
+# Create mount points (these will be replaced by volume mounts)
+RUN mkdir -p /workspace/vllm /workspace/flashinfer
+
+# =============================================================================
+# Tiktoken encodings (for tokenizer support)
+# Uses cache mount to avoid re-downloading on each build
+# =============================================================================
+
+RUN --mount=type=cache,id=tiktoken-cache,target=/tiktoken-cache \
+    mkdir -p /workspace/tiktoken_encodings && \
+    if [ ! -f "/tiktoken-cache/o200k_base.tiktoken" ]; then \
+        echo "=== Cache miss: Downloading tiktoken encodings ===" && \
+        wget -q -O /tiktoken-cache/o200k_base.tiktoken \
+            "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" && \
+        wget -q -O /tiktoken-cache/cl100k_base.tiktoken \
+            "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"; \
+    else \
+        echo "=== Cache hit: Using cached tiktoken encodings ==="; \
+    fi && \
+    cp /tiktoken-cache/o200k_base.tiktoken /workspace/tiktoken_encodings/ && \
+    cp /tiktoken-cache/cl100k_base.tiktoken /workspace/tiktoken_encodings/
+
+
+# =============================================================================
+# llama-benchy installation (benchmarking tool)
+# =============================================================================
+
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv pip install llama-benchy
+
+# =============================================================================
+# Development entrypoint - DOES NOT TOUCH GIT BRANCHES
+# =============================================================================
+
+RUN cat > /workspace/dev-entrypoint.sh << 'ENTRYPOINT_EOF'
+#!/bin/bash
+set -e
+
+echo "=============================================="
+echo "Development Environment"
+echo "=============================================="
+
+# Mark mounted directories as safe for git
+git config --global --add safe.directory /workspace/flashinfer
+git config --global --add safe.directory /workspace/vllm
+
+# Check if repos are mounted
+if [ ! -f "/workspace/flashinfer/pyproject.toml" ]; then
+    echo "ERROR: FlashInfer not mounted at /workspace/flashinfer"
+    echo "Mount with: -v ~/projects/flashinfer:/workspace/flashinfer"
+    exit 1
+fi
+
+if [ ! -f "/workspace/vllm/pyproject.toml" ]; then
+    echo "ERROR: vLLM not mounted at /workspace/vllm"
+    echo "Mount with: -v ~/projects/vllm:/workspace/vllm"
+    exit 1
+fi
+
+# Function to check if FlashInfer is properly installed
+flashinfer_installed() {
+    python -c "from flashinfer._build_meta import __version__; import flashinfer.jit" 2>/dev/null
+}
+
+# Function to check if vLLM is properly installed
+vllm_installed() {
+    python -c "from vllm.entrypoints.openai.api_server import run_server" 2>/dev/null
+}
+
+# Show current state (DO NOT MODIFY)
+echo ""
+echo "Mounted Repositories:"
+echo "  FlashInfer: $(cd /workspace/flashinfer && git rev-parse --abbrev-ref HEAD) @ $(cd /workspace/flashinfer && git log --oneline -1 | cut -c1-40)"
+echo "  vLLM:       $(cd /workspace/vllm && git rev-parse --abbrev-ref HEAD) @ $(cd /workspace/vllm && git log --oneline -1 | cut -c1-40)"
+
+# Check FlashInfer
+echo ""
+if flashinfer_installed; then
+    echo "✓ FlashInfer: installed"
+else
+    echo "✗ FlashInfer: NOT installed"
+    echo "  Run: cd /workspace/flashinfer && uv pip install --no-build-isolation -e . -v"
+fi
+
+# Check vLLM
+if vllm_installed; then
+    echo "✓ vLLM: installed"
+else
+    echo "✗ vLLM: NOT installed"
+    echo "  Run: cd /workspace/vllm && python3 use_existing_torch.py && uv pip install -r requirements/build.txt && uv pip install --no-build-isolation -e ."
+fi
+
+# Show versions if installed
+echo ""
+echo "Versions:"
+python -c "import torch; print(f'  PyTorch: {torch.__version__}')"
+python -c "import torch; print(f'  CUDA: {torch.version.cuda}')"
+python -c "from flashinfer._build_meta import __version__; print(f'  FlashInfer: {__version__}')" 2>/dev/null || echo "  FlashInfer: (not installed)"
+python -c "import vllm; print(f'  vLLM: {vllm.__version__}')" 2>/dev/null || echo "  vLLM: (not installed)"
+
+echo ""
+echo "=============================================="
+echo "Quick Commands"
+echo "=============================================="
+echo ""
+echo "Install/Reinstall:"
+echo "  FlashInfer: cd /workspace/flashinfer && git submodule update --init --recursive && uv pip install --no-build-isolation -e . -v"
+echo "  vLLM:       cd /workspace/vllm && python3 use_existing_torch.py && uv pip install -r requirements/build.txt && uv pip install --no-build-isolation -e ."
+echo ""
+echo "Serve Model:"
+echo "  python -m vllm.entrypoints.openai.api_server --model openai/gpt-oss-120b --quantization mxfp4 --host 0.0.0.0 --port 8000"
+echo ""
+echo "Utilities:"
+echo "  Clear JIT cache: rm -rf ~/.cache/flashinfer/"
+echo "  Ccache stats:    ccache -s"
+echo ""
+
+# Execute the passed command or start a shell
+if [ $# -eq 0 ]; then
+    exec /bin/bash
+else
+    exec "$@"
+fi
+ENTRYPOINT_EOF
+
+RUN chmod +x /workspace/dev-entrypoint.sh
+
+# =============================================================================
+# Helper scripts
+# =============================================================================
+
+RUN cat > /workspace/install-flashinfer.sh << 'EOF'
+#!/bin/bash
+set -e
+cd /workspace/flashinfer
+git submodule update --init --recursive
+uv pip install --no-build-isolation -e . -v
+EOF
+
+RUN cat > /workspace/install-vllm.sh << 'EOF'
+#!/bin/bash
+set -e
+cd /workspace/vllm
+python3 use_existing_torch.py
+sed -i "/flashinfer/d" requirements/cuda.txt 2>/dev/null || true
+uv pip install -r requirements/build.txt
+uv pip install --no-build-isolation -e .
+EOF
+
+RUN chmod +x /workspace/install-flashinfer.sh /workspace/install-vllm.sh
+
+ENTRYPOINT ["/workspace/dev-entrypoint.sh"]
+CMD ["/bin/bash"]
+
+EXPOSE 8000
