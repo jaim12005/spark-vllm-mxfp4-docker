@@ -53,6 +53,10 @@ class ProfileConfig:
     num_qo_heads: int = 32
     num_kv_heads: int = 8
     head_dim: int = 128
+    # KV layout: "NHD" or "HND"
+    # Note: vLLM may force HND internally, so profiler results with NHD
+    # may not reflect production kernel paths. Set to match your vLLM config.
+    kv_layout: str = "HND"
 
 
 @dataclass 
@@ -233,7 +237,7 @@ def profile_moe_gemm_decode(config: ProfileConfig) -> List[ProfileResult]:
                 routed_scaling_factor=None,
                 routing_method_type=int(RoutingMethodType.Default),
                 do_finalize=True,
-                gated_act_type=int(GatedActType.Silu),
+                gated_act_type=int(GatedActType.SwiGlu),
             )[0]
         
         try:
@@ -303,19 +307,32 @@ def profile_attention_decode(config: ProfileConfig) -> List[ProfileResult]:
                 
                 wrapper = BatchDecodeWithPagedKVCacheWrapper(
                     workspace_buffer,
-                    kv_layout="NHD",
+                    kv_layout=config.kv_layout,
                 )
                 
-                # Create paged KV cache
+                # Create paged KV cache with appropriate layout
                 total_pages = batch_size * num_pages_per_seq
-                k_cache = torch.randn(
-                    total_pages, page_size, num_kv_heads, head_dim,
-                    dtype=torch.bfloat16, device=device
-                )
-                v_cache = torch.randn(
-                    total_pages, page_size, num_kv_heads, head_dim,
-                    dtype=torch.bfloat16, device=device
-                )
+                
+                if config.kv_layout == "NHD":
+                    # NHD layout: (num_pages, page_size, num_kv_heads, head_dim)
+                    k_cache = torch.randn(
+                        total_pages, page_size, num_kv_heads, head_dim,
+                        dtype=torch.bfloat16, device=device
+                    )
+                    v_cache = torch.randn(
+                        total_pages, page_size, num_kv_heads, head_dim,
+                        dtype=torch.bfloat16, device=device
+                    )
+                else:
+                    # HND layout: (num_pages, num_kv_heads, page_size, head_dim)
+                    k_cache = torch.randn(
+                        total_pages, num_kv_heads, page_size, head_dim,
+                        dtype=torch.bfloat16, device=device
+                    )
+                    v_cache = torch.randn(
+                        total_pages, num_kv_heads, page_size, head_dim,
+                        dtype=torch.bfloat16, device=device
+                    )
                 
                 # Query (one per request)
                 q = torch.randn(
@@ -430,7 +447,7 @@ def profile_with_torch_profiler(config: ProfileConfig) -> Dict[str, Any]:
                 routed_scaling_factor=None,
                 routing_method_type=int(RoutingMethodType.Default),
                 do_finalize=True,
-                gated_act_type=int(GatedActType.Silu),
+                gated_act_type=int(GatedActType.SwiGlu),
             )[0]
         
         # Warmup
@@ -573,6 +590,10 @@ def main():
     parser.add_argument("--no-cupti", action="store_true", help="Disable CUPTI timing")
     parser.add_argument("--no-torch-profiler", action="store_true", help="Skip torch profiler")
     parser.add_argument("--quick", action="store_true", help="Quick profile with fewer configs")
+    parser.add_argument(
+        "--kv-layout", type=str, default="HND", choices=["NHD", "HND"],
+        help="KV cache layout. vLLM typically forces HND. Default: HND"
+    )
     
     args = parser.parse_args()
     
@@ -582,6 +603,7 @@ def main():
         num_iterations=args.num_iterations,
         use_cupti=not args.no_cupti,
         use_torch_profiler=not args.no_torch_profiler,
+        kv_layout=args.kv_layout,
     )
     
     if args.quick:

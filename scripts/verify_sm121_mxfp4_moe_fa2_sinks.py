@@ -193,13 +193,16 @@ def verify_environment(config: TestConfig, results: TestResults) -> bool:
 
 
 # =============================================================================
-# MXFP4 MoE GEMM Tests
+# SM121 CUTLASS MoE GEMM Tests (BF16 Weights)
 # =============================================================================
+# Note: This tests the SM121 CUTLASS MoE path with BF16 weights, not MXFP4/FP4.
+# The MXFP4 weight path requires NVFP4 format which has additional complexity.
+# This verifies the CUTLASS MoE kernel works on SM121.
 
 def test_mxfp4_moe_gemm(config: TestConfig, results: TestResults) -> bool:
-    """Test MXFP4 MoE GEMM functionality on SM121 using cutlass_fused_moe."""
+    """Test SM121 CUTLASS MoE GEMM with BF16 weights (validates SM121 kernel path)."""
     
-    print("\n=== SM121 CUTLASS MoE GEMM Tests ===")
+    print("\n=== SM121 CUTLASS MoE GEMM Tests (BF16 Weights) ===")
     
     try:
         from flashinfer.fused_moe.core import cutlass_fused_moe, get_cutlass_fused_moe_module

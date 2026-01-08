@@ -1,1 +1,47 @@
-.cache
+# Cache directories
+.cache/
+
+# Test logs (generated per run)
+test_logs/
+
+# Test output artifacts (keep curated reports, ignore generated)
+test_outputs/verification_results.json
+test_outputs/stress_result_*.json
+test_outputs/concurrent_results/
+
+# Profile outputs
+profile_outputs/
+
+# Nsight profiling files
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.sqlite
+*.nvvp
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log.tmp

@@ -64,6 +64,7 @@ if [[ "$DEBUG_MODE" == "1" ]]; then
     export TORCH_SHOW_CPP_STACKTRACES=1
     export NCCL_ASYNC_ERROR_HANDLING=1
     export NCCL_DEBUG=INFO
+    export PYTHONUNBUFFERED=1  # Ensure Python output is not buffered (helpful for crash debugging)
 fi
 
 # FlashInfer logging
@@ -161,33 +162,39 @@ setup_logging() {
 # Global variable to track server PID
 SERVER_PID=""
 SERVER_PGID=""
+STARTED_SERVER=0  # Track if WE started the server (for cleanup)
 
-# Cleanup function - kills entire process group
+# Cleanup function - kills entire process group only if we started the server
 cleanup() {
     local exit_code=$?
     log_info "Running cleanup (exit code: $exit_code)..."
     
-    if [[ -n "$SERVER_PGID" ]]; then
-        log_info "Killing process group: -$SERVER_PGID"
-        kill -- -"$SERVER_PGID" 2>/dev/null || true
+    # Only kill processes if WE started the server
+    if [[ "$STARTED_SERVER" -eq 1 ]]; then
+        if [[ -n "$SERVER_PGID" ]]; then
+            log_info "Killing process group: -$SERVER_PGID"
+            kill -- -"$SERVER_PGID" 2>/dev/null || true
+            
+            # Wait and force kill if needed
+            sleep 2
+            kill -9 -- -"$SERVER_PGID" 2>/dev/null || true
+        fi
         
-        # Wait and force kill if needed
-        sleep 2
-        kill -9 -- -"$SERVER_PGID" 2>/dev/null || true
+        if [[ -n "$SERVER_PID" ]]; then
+            log_info "Killing server PID: $SERVER_PID"
+            kill "$SERVER_PID" 2>/dev/null || true
+            kill -9 "$SERVER_PID" 2>/dev/null || true
+        fi
+        
+        # Kill any orphaned vLLM processes (only if we started server)
+        pkill -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+        pkill -f "EngineCore" 2>/dev/null || true
+        
+        # Check for zombies
+        check_zombies
+    else
+        log_info "Skipping process cleanup (--skip-server mode or server not started)"
     fi
-    
-    if [[ -n "$SERVER_PID" ]]; then
-        log_info "Killing server PID: $SERVER_PID"
-        kill "$SERVER_PID" 2>/dev/null || true
-        kill -9 "$SERVER_PID" 2>/dev/null || true
-    fi
-    
-    # Kill any orphaned vLLM processes
-    pkill -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
-    pkill -f "EngineCore" 2>/dev/null || true
-    
-    # Check for zombies
-    check_zombies
     
     log_info "Cleanup complete"
 }
@@ -345,6 +352,22 @@ validate_compose_env_parity() {
 validate_environment() {
     log_info "Validating environment..."
     
+    # Check required tools
+    if ! command -v jq >/dev/null 2>&1; then
+        log_error "jq not found - required for JSON parsing. Install with: apt-get install jq"
+        return 1
+    fi
+    
+    if ! command -v bc >/dev/null 2>&1; then
+        log_error "bc not found - required for calculations. Install with: apt-get install bc"
+        return 1
+    fi
+    
+    if ! command -v curl >/dev/null 2>&1; then
+        log_error "curl not found - required for API testing. Install with: apt-get install curl"
+        return 1
+    fi
+    
     # Check GPU
     if ! nvidia-smi &>/dev/null; then
         log_error "nvidia-smi not available"
@@ -425,8 +448,11 @@ start_vllm_server() {
     cmd+=(--override-generation-config '{"temperature":1.0,"top_p":1.0,"top_k":0}')
     
     # Performance options
-    if [[ "${VLLM_USE_CUDA_GRAPH:-1}" == "1" ]]; then
-        cmd+=(--enforce-eager=False)
+    # Note: --enforce-eager is a boolean flag (present = True), not --flag=False style
+    # When VLLM_USE_CUDA_GRAPH=1 (default), we do NOT add --enforce-eager to allow CUDA graphs
+    # Only add --enforce-eager if explicitly disabled
+    if [[ "${VLLM_USE_CUDA_GRAPH:-1}" == "0" ]]; then
+        cmd+=(--enforce-eager)
     fi
     
     # Async scheduling and prefix caching (from docker-compose)
@@ -448,6 +474,7 @@ start_vllm_server() {
     setsid stdbuf -oL -eL "${cmd[@]}" > "$log_file" 2>&1 &
     SERVER_PID=$!
     SERVER_PGID=$(ps -o pgid= -p "$SERVER_PID" | tr -d ' ')
+    STARTED_SERVER=1  # Mark that we started the server (for cleanup)
     
     log_info "Server PID: $SERVER_PID, PGID: $SERVER_PGID"
     
@@ -526,11 +553,12 @@ stop_vllm_server() {
 verify_backends() {
     log_info "=== Backend Verification ==="
     local log_file="$RUN_LOG_DIR/vllm_server.log"
-    local verification_passed=true
+    local verification_passed=0  # 0 = pass, 1 = fail (shell convention)
     
     # Create summary file
     local summary_file="$RUN_LOG_DIR/backend_summary.log"
     
+    # Build summary content without piping (to avoid subshell variable loss)
     {
         echo "=== Backend Summary ==="
         echo "Timestamp: $(date)"
@@ -581,35 +609,38 @@ verify_backends() {
             echo "vLLM mount: /workspace/vllm"
         else
             echo "Running on host"
-            echo "FlashInfer: $REPO_ROOT"
+            echo "FlashInfer: $FLASHINFER_ROOT"
         fi
         
         echo ""
         echo "--- Verification Status ---"
-        
-        # Check critical settings
-        if [[ "${VLLM_ATTENTION_BACKEND:-}" != "FLASHINFER" ]]; then
-            echo "WARN: VLLM_ATTENTION_BACKEND != FLASHINFER"
-            verification_passed=false
-        else
-            echo "OK: VLLM_ATTENTION_BACKEND = FLASHINFER"
-        fi
-        
-        if [[ "${VLLM_USE_FLASHINFER_MOE_MXFP4_BF16:-0}" != "1" ]]; then
-            echo "WARN: VLLM_USE_FLASHINFER_MOE_MXFP4_BF16 != 1"
-        else
-            echo "OK: MXFP4 BF16 MoE enabled"
-        fi
-        
-    } | tee "$summary_file"
+    } > "$summary_file"
     
-    if $verification_passed; then
-        log_success "Backend verification passed"
+    # Check critical settings OUTSIDE the block to avoid subshell issues
+    if [[ "${VLLM_ATTENTION_BACKEND:-}" != "FLASHINFER" ]]; then
+        echo "WARN: VLLM_ATTENTION_BACKEND != FLASHINFER" | tee -a "$summary_file"
+        verification_passed=1
     else
-        log_warn "Backend verification had issues - check $summary_file"
+        echo "OK: VLLM_ATTENTION_BACKEND = FLASHINFER" | tee -a "$summary_file"
     fi
     
-    return 0
+    if [[ "${VLLM_USE_FLASHINFER_MOE_MXFP4_BF16:-0}" != "1" ]]; then
+        echo "WARN: VLLM_USE_FLASHINFER_MOE_MXFP4_BF16 != 1" | tee -a "$summary_file"
+        # Not a hard failure, just a warning
+    else
+        echo "OK: MXFP4 BF16 MoE enabled" | tee -a "$summary_file"
+    fi
+    
+    # Display the summary
+    cat "$summary_file"
+    
+    if [[ $verification_passed -eq 0 ]]; then
+        log_success "Backend verification passed"
+        return 0
+    else
+        log_warn "Backend verification had issues - check $summary_file"
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -804,15 +835,16 @@ run_stress_tests() {
     local initial_mem
     initial_mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
     
-    # Create stress test script
+    # Create stress test script (using urllib to avoid requests dependency)
     cat > "$RUN_LOG_DIR/stress_worker.py" << 'STRESS_SCRIPT'
 #!/usr/bin/env python3
 import sys
 import json
 import time
 import random
-import requests
 import argparse
+import urllib.request
+import urllib.error
 
 def make_request(port, model, seed):
     random.seed(seed)
@@ -826,29 +858,34 @@ def make_request(port, model, seed):
     temperature = random.uniform(0.1, 1.0)
     top_p = random.uniform(0.8, 1.0)
     
+    url = f"http://localhost:{port}/v1/completions"
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+    }).encode('utf-8')
+    
+    headers = {"Content-Type": "application/json"}
+    req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+    
     start = time.time()
     try:
-        response = requests.post(
-            f"http://localhost:{port}/v1/completions",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-            },
-            timeout=120
-        )
-        latency = time.time() - start
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("choices") and data["choices"][0].get("text"):
-                return {"success": True, "latency": latency, "status": 200}
+        with urllib.request.urlopen(req, timeout=120) as response:
+            latency = time.time() - start
+            status_code = response.status
+            data = json.loads(response.read().decode('utf-8'))
+            
+            if status_code == 200:
+                if data.get("choices") and data["choices"][0].get("text"):
+                    return {"success": True, "latency": latency, "status": 200}
+                else:
+                    return {"success": False, "error": "Empty response", "latency": latency, "status": 200}
             else:
-                return {"success": False, "error": "Empty response", "latency": latency, "status": 200}
-        else:
-            return {"success": False, "error": f"HTTP {response.status_code}", "latency": latency, "status": response.status_code}
+                return {"success": False, "error": f"HTTP {status_code}", "latency": latency, "status": status_code}
+    except urllib.error.HTTPError as e:
+        return {"success": False, "error": f"HTTP {e.code}", "latency": time.time() - start, "status": e.code}
     except Exception as e:
         return {"success": False, "error": str(e), "latency": time.time() - start, "status": 0}
 
@@ -1004,7 +1041,8 @@ run_benchmarks() {
     local model_name="${VLLM_SERVED_MODEL_NAME:-gpt-oss-120b}"
     
     # CSV header
-    echo "test_type,prompt_len,generation_len,batch_size,ttft_ms,tpot_ms,throughput_tok_s" > "$results_file"
+    # Note: http_ttft_ms is end-to-end HTTP latency, not model-internal TTFT
+    echo "test_type,prompt_len,generation_len,batch_size,http_ttft_ms,tpot_ms,throughput_tok_s" > "$results_file"
     
     # Run FlashInfer microbenchmarks (if available)
     if [[ -f "$FLASHINFER_ROOT/benchmarks/sm121_mxfp4_moe_gemm_bench.py" ]]; then
@@ -1017,8 +1055,8 @@ run_benchmarks() {
             2>&1 | tee "$RUN_LOG_DIR/moe_gemm_bench.log" || log_warn "MoE GEMM benchmark failed"
     fi
     
-    # Prefill benchmark (TTFT)
-    log_info "Running prefill benchmarks (TTFT)..."
+    # Prefill benchmark (HTTP TTFT - end-to-end, includes client/server overhead)
+    log_info "Running prefill benchmarks (HTTP TTFT)..."
     for prompt_len in 512 1024 2048 4096; do
         local prompt
         prompt=$(python3 -c "print('word ' * ($prompt_len // 4))")
@@ -1040,7 +1078,7 @@ run_benchmarks() {
         ttft=$(echo "scale=3; ($end_time - $start_time) * 1000" | bc)
         
         echo "prefill,$prompt_len,1,1,$ttft,N/A,N/A" >> "$results_file"
-        log_info "Prefill $prompt_len tokens: TTFT=${ttft}ms"
+        log_info "Prefill $prompt_len tokens: HTTP TTFT=${ttft}ms (end-to-end)"
     done
     
     # Decode benchmark (TPOT, throughput)
