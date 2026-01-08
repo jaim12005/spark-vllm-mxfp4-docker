@@ -182,13 +182,69 @@ Based on llama.cpp results:
 
 ---
 
-## Next Steps
+## Benchmark Results (Implemented)
 
-1. [ ] Create `gemv_fp4_dp4a.cu` kernel skeleton
-2. [ ] Implement Q8_1 activation quantization
-3. [ ] Benchmark standalone kernel vs CUTLASS
-4. [ ] Integrate into FlashInfer MoE pipeline
-5. [ ] Add dispatch logic for M-threshold
+### DP4A GEMV Performance
+
+| Config | DP4A (ms) | PyTorch BF16 (ms) | Speedup |
+|--------|-----------|-------------------|---------|
+| FC1 (4096→11776) | 0.310 | 0.408 | **1.32x** |
+| FC2 (11776→4096) | 0.254 | 0.387 | **1.52x** |
+
+### Critical Finding: GEMV is NOT the Solution for MoE
+
+**Problem**: Per-expert GEMV is slower than CUTLASS grouped GEMM!
+
+| Approach | 60 Layers (TopK=8) | Why |
+|----------|---------------------|-----|
+| **CUTLASS grouped GEMM** | 182.88 ms | Batches all experts, reuses weights |
+| **DP4A per-expert GEMV** | 270.38 ms | 8x memory traffic (no weight reuse) |
+| **Target (llama.cpp)** | ~103 ms | Different architecture |
+
+**Root cause**: The CUTLASS grouped GEMM achieves **weight reuse** by processing all 8 experts in a single kernel. The tile inefficiency (0.78% at M=1) is outweighed by the memory bandwidth savings from not re-reading weights 8 times.
+
+### Memory Bandwidth Analysis
+
+| Metric | Value |
+|--------|-------|
+| FC1 weight size | 25.66 MB (MXFP4) |
+| Peak memory-bound time | 0.032 ms |
+| Achieved DP4A time | 0.31 ms |
+| **Efficiency** | **~10% of peak** |
+
+Our DP4A kernel achieves only 10% of memory bandwidth, suggesting room for optimization, but even at 100% efficiency:
+- 8 experts × 2 GEMVs × 0.032 ms = 0.51 ms per layer
+- 60 layers × 0.51 ms = **30.7 ms** (best possible with GEMV)
+
+Compare to CUTLASS grouped GEMM: **182.88 ms / 60 = 3.05 ms per layer**.
+
+The 6x gap shows that CUTLASS is **not just reusing weights once per token, but across multiple tokens** in a way our GEMV cannot.
+
+## Conclusion
+
+**GEMV is fundamentally the wrong approach for MoE decode on this architecture.**
+
+The grouped GEMM in CUTLASS, despite its M=128 tile constraint, achieves better memory efficiency through:
+1. **Weight reuse across experts** - All 8 experts share the same weight loading
+2. **Batched computation** - Single kernel launch vs 8+ launches
+3. **Better memory access patterns** - Coalesced TMA loads
+
+### What llama.cpp Does Differently
+
+llama.cpp achieves 58 tok/s vs our 29 tok/s. The key differences may be:
+
+1. **No MoE layer overhead** - Dense attention only
+2. **Simpler architecture** - Less Python/framework overhead
+3. **Fused kernels** - QKV projection fused with attention
+4. **Different model** - May use different quantization
+
+### Recommended Next Steps
+
+1. [x] ~~Create `gemv_fp4_dp4a.cu` kernel~~ (Done, but not viable)
+2. [x] ~~Benchmark vs CUTLASS~~ (Done, CUTLASS wins)
+3. [ ] **Profile llama.cpp** to understand their decode approach
+4. [ ] **Investigate speculative decoding** to increase effective batch size
+5. [ ] **Focus on attention GEMV** instead of MoE (51% of decode time)
 
 ---
 
