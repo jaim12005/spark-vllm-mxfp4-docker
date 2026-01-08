@@ -276,10 +276,57 @@ struct Arguments {
 
 ---
 
-## Next Steps
+## Progress Summary
 
-1. **Immediate**: Create standalone GEMV benchmark to validate performance potential
-2. **This week**: Implement Phase 1 (kernel wrapper)
-3. **Next week**: Integrate into FlashInfer MoE pipeline
-4. **Week 3**: Optimize and benchmark against llama.cpp
+### Completed (2026-01-08)
+
+**Phase 1: Standalone GEMV Kernel Wrapper ✅**
+
+Created the following files in FlashInfer:
+- `flashinfer/gemv/__init__.py` - Module exports
+- `flashinfer/gemv/core.py` - Python interface with `should_use_gemv_for_moe()` heuristic
+- `flashinfer/jit/gemv.py` - JIT compilation spec
+- `csrc/gemv/gemv_fp4_blockscaled.cu` - CUDA kernel with software dequant fallback
+
+Created in mxfp4:
+- `scripts/benchmark_cutlass_gemv.py` - Benchmark script
+
+**Benchmark Results (Software Dequant Fallback):**
+```
+GEMV (FP4 fallback): 0.462 ms per call (M=1, K=4096, N=11776)
+PyTorch BF16 matmul: 0.427 ms per call
+
+Estimated performance: ~7.2 tok/s (vs. target ~58 tok/s)
+```
+
+The software dequantization fallback is slow (as expected) because it:
+1. Dequantizes FP4 values in software (no Tensor Core usage)
+2. Has suboptimal memory access patterns
+3. Doesn't fuse operations
+
+### Next: Phase 2 - CUTLASS GemvBlockScaled Integration
+
+**Key findings from CUTLASS analysis:**
+
+1. **GemvBlockScaled requirements:**
+   - `kElementsPerAccess = 32` (hardcoded for FP4)
+   - `kSFVecSize = 16` (hardcoded)
+   - Both A and B must be FP4 (e2m1)
+   - Scale factors must be FP8 (e4m3)
+
+2. **Integration challenge:**
+   - MXFP4 activations come as BF16 and need quantization
+   - Scale factor layout must match MXFP4 format
+   - Custom epilogue needed for BF16 output
+
+3. **Approach:**
+   - Use existing `mxfp4_quantize()` for BF16→FP4 conversion
+   - Instantiate GemvBlockScaled with proper epilogue
+   - Handle batching over experts
+
+### Remaining Work
+
+1. **Phase 2**: Integrate CUTLASS GemvBlockScaled native kernel
+2. **Phase 3**: Add dispatch logic in FlashInfer MoE pipeline
+3. **Phase 4**: Benchmark and optimize to match llama.cpp (~58 tok/s)
 
