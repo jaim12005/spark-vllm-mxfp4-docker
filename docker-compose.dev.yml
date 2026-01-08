@@ -57,8 +57,9 @@ services:
     # Environment variables
     environment:
       # CRITICAL: Required for FlashInfer CUTLASS MoE to work with editable install
-      # Note: This prepends to PYTHONPATH, not overwrites (${PYTHONPATH:+:$PYTHONPATH} appends if set)
-      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm
+      # This sets PYTHONPATH to include both repos. The ${PYTHONPATH:+:$PYTHONPATH} suffix
+      # preserves any existing PYTHONPATH from the image (requires modern docker compose).
+      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
       
       # vLLM PR branch for SM121/Blackwell support
       - VLLM_PR_NUMBER=31740
@@ -126,7 +127,7 @@ services:
     
     environment:
       # CRITICAL: Required for FlashInfer CUTLASS MoE to work with editable install
-      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm
+      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
       
       # vLLM PR branch for SM121/Blackwell support
       - VLLM_PR_NUMBER=31740

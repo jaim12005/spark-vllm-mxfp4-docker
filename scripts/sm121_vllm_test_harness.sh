@@ -385,15 +385,25 @@ validate_environment() {
         log_success "SM121 GPU detected"
     fi
     
-    # Check Python imports
-    python3 -c "import flashinfer; print(f'FlashInfer version: {flashinfer.__version__}')" 2>&1 || {
+    # Check Python imports and PRINT IMPORT LOCATIONS (ends debates about which copy is running)
+    python3 -c "
+import flashinfer
+import os
+print(f'FlashInfer version: {flashinfer.__version__}')
+print(f'FlashInfer location: {flashinfer.__file__}')
+" 2>&1 || {
         log_error "FlashInfer import failed"
         return 1
     }
     
     # Check vLLM (if in Docker, it should be importable)
     if $IN_DOCKER; then
-        python3 -c "import vllm; print(f'vLLM version: {vllm.__version__}')" 2>&1 || {
+        python3 -c "
+import vllm
+import os
+print(f'vLLM version: {vllm.__version__}')
+print(f'vLLM location: {vllm.__file__}')
+" 2>&1 || {
             log_error "vLLM import failed"
             return 1
         }
@@ -631,8 +641,8 @@ verify_backends() {
         echo "OK: MXFP4 BF16 MoE enabled" | tee -a "$summary_file"
     fi
     
-    # Display the summary
-    cat "$summary_file"
+    # Display the summary (|| true for belt-and-suspenders robustness)
+    cat "$summary_file" || true
     
     if [[ $verification_passed -eq 0 ]]; then
         log_success "Backend verification passed"

@@ -4,10 +4,10 @@
 # Test logs (generated per run)
 test_logs/
 
-# Test output artifacts (keep curated reports, ignore generated)
-test_outputs/verification_results.json
-test_outputs/stress_result_*.json
-test_outputs/concurrent_results/
+# Test output artifacts
+# Note: Most harness outputs go under test_logs/ (already ignored above)
+# This catches any loose test artifacts in root or test_outputs/
+test_outputs/
 
 # Profile outputs
 profile_outputs/
