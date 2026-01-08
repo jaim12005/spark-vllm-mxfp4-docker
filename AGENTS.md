@@ -589,21 +589,30 @@ Created infrastructure for GEMV-based decode optimization:
 - `csrc/gemv/gemv_fp4_blockscaled.cu` - CUDA kernel (software fallback)
 - `csrc/gemv/gemv_epilogue_bf16.h` - Custom epilogue for BF16 output
 
-**Benchmark (software dequant fallback):**
+**Benchmark Results (DP4A llama.cpp-style kernel):**
 ```
-GEMV: ~0.46 ms per call → ~7.2 tok/s (too slow)
+FC1 (4096→11776): 0.31 ms at 312 GFLOPS (1.32x faster than PyTorch BF16)
+FC2 (11776→4096): 0.25 ms at 380 GFLOPS (1.52x faster than PyTorch BF16)
 ```
 
-Native CUTLASS `GemvBlockScaled` integration deferred due to:
-- Namespace conflicts in CUTLASS headers
-- Complex custom epilogue requirements
-- Template parameter matching challenges
+### CRITICAL FINDING: GEMV is NOT the Solution for MoE
 
-### Recommended Next Steps
+**GEMV is slower than CUTLASS grouped GEMM for MoE decode!**
 
-1. **Try draft model speculation** with a small compatible model
-2. **Investigate llama.cpp's decode kernel** for their GEMV approach
-3. **Consider custom CUDA kernel** if CUTLASS integration remains difficult
+| Approach | 60 Layers (TopK=8) | Why |
+|----------|---------------------|-----|
+| CUTLASS grouped GEMM | 182.88 ms | Batches all experts, reuses weights |
+| DP4A per-expert GEMV | 270.38 ms | 8x memory traffic (no weight reuse) |
+
+The grouped GEMM's weight reuse across all 8 experts outweighs the M=128 tile inefficiency.
+
+### Updated Next Steps
+
+1. ~~Investigate llama.cpp's decode kernel~~ (Done - implemented DP4A kernel)
+2. ~~Benchmark GEMV vs grouped GEMM~~ (Done - grouped GEMM wins)
+3. **Focus on attention GEMV** (51% of decode time per nsys)
+4. **Try draft model speculation** to increase effective batch size
+5. **Profile llama.cpp architecture** to understand their dense model advantage
 
 ---
 
