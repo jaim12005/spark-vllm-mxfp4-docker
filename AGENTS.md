@@ -194,13 +194,91 @@ FlashInfer's namespace package structure requires explicit PYTHONPATH. Without i
 
 ---
 
-## Performance Target
+## Performance Targets (Scores to Beat)
 
-| Metric | Current | Target | Comparison |
-|--------|---------|--------|------------|
-| Decode throughput (tg32) | TBD | ≥ llama.cpp | Within 10-20% |
-| Prefill throughput (pp2048) | TBD | ≥ SGLang | Comparable |
-| TTFT @ 8k context | TBD | TBD | Measure baseline |
+### The Problem: vLLM wins prefill but loses decode
+
+| Depth | llama.cpp pp | vLLM pp | llama.cpp tg | vLLM tg | SGLang tg |
+|-------|--------------|---------|--------------|---------|-----------|
+| 0 | 2449.83 | **4663.70** ✓ | **57.85** | 33.55 ❌ | ~52 |
+| 4096 | 2293.59 | **3172.51** ✓ | **54.81** | 32.63 ❌ | - |
+| 8192 | 2147.98 | **2687.84** ✓ | **52.14** | 31.50 ❌ | - |
+| 16384 | 1845.71 | **2044.47** ✓ | **48.53** | 29.55 ❌ | - |
+| 32768 | 1404.70 | 1398.80 | **41.72** | 26.65 ❌ | - |
+
+**Key insight**: vLLM is ~2x better on prefill, but ~40% slower on decode.
+
+### Targets
+
+| Metric | Current (vLLM) | Target | Gap |
+|--------|----------------|--------|-----|
+| **tg32 @ d0** | 33.55 t/s | ≥52 t/s | +55% needed |
+| **tg32 @ d4096** | 32.63 t/s | ≥47 t/s | +44% needed |
+| **tg32 @ d8192** | 31.50 t/s | ≥41 t/s | +30% needed |
+| **tg32 @ d16384** | 29.55 t/s | ≥34 t/s | +15% needed |
+| **tg32 @ d32768** | 26.65 t/s | ≥26 t/s | ✓ (parity) |
+
+At longer contexts (32k), vLLM catches up. The decode gap narrows with depth.
+
+### SGLang Reference (single prompt)
+
+```
+Output token throughput: 52.37 tok/s
+TTFT: 49.87 ms  
+TPOT: 18.83 ms (time per output token)
+```
+
+### Full Benchmark Data
+
+<details>
+<summary>llama.cpp (llama-bench, build f5acfb2ff)</summary>
+
+```
+model                      test              t/s
+gpt-oss 120B MXFP4 MoE    pp2048            2449.83 ± 10.27
+gpt-oss 120B MXFP4 MoE    tg32              57.85 ± 0.44
+gpt-oss 120B MXFP4 MoE    pp2048 @ d4096    2293.59 ± 8.99
+gpt-oss 120B MXFP4 MoE    tg32 @ d4096      54.81 ± 0.30
+gpt-oss 120B MXFP4 MoE    pp2048 @ d8192    2147.98 ± 10.64
+gpt-oss 120B MXFP4 MoE    tg32 @ d8192      52.14 ± 0.50
+gpt-oss 120B MXFP4 MoE    pp2048 @ d16384   1845.71 ± 7.11
+gpt-oss 120B MXFP4 MoE    tg32 @ d16384     48.53 ± 0.36
+gpt-oss 120B MXFP4 MoE    pp2048 @ d32768   1404.70 ± 7.36
+gpt-oss 120B MXFP4 MoE    tg32 @ d32768     41.72 ± 0.18
+```
+
+</details>
+
+<details>
+<summary>vLLM (llama-benchy, single Spark)</summary>
+
+```
+model                 test               t/s           e2e_ttft (ms)
+openai/gpt-oss-120b   pp2048             4663.70±42    614.72±3
+openai/gpt-oss-120b   tg32               33.55±0.05    
+openai/gpt-oss-120b   pp2048 @ d4096     3172.51±16    821.97±4
+openai/gpt-oss-120b   tg32 @ d4096       32.63±0.02    
+openai/gpt-oss-120b   pp2048 @ d8192     2687.84±9     941.50±3
+openai/gpt-oss-120b   tg32 @ d8192       31.50±0.10    
+openai/gpt-oss-120b   pp2048 @ d16384    2044.47±8     1186.10±5
+openai/gpt-oss-120b   tg32 @ d16384      29.55±0.01    
+openai/gpt-oss-120b   pp2048 @ d32768    1398.80±4     1659.47±5
+openai/gpt-oss-120b   tg32 @ d32768      26.65±0.01    
+```
+
+</details>
+
+### Decode Bottleneck Analysis
+
+The decode gap (33 vs 58 tok/s) suggests:
+
+1. **MoE routing overhead?** - Per-token expert selection has fixed cost
+2. **Attention decode kernel?** - FA2 decode path efficiency on SM121
+3. **Python/IPC overhead?** - vLLM's scheduler, ZMQ, async engine
+4. **CUDA graph effectiveness?** - Are graphs actually being used for decode?
+5. **KV cache access pattern?** - Memory bandwidth during decode
+
+**Priority**: Profile decode-heavy workload to identify top kernels and CPU time.
 
 ---
 
