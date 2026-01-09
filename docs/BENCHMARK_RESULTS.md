@@ -8,28 +8,26 @@ Live tracking of benchmark results across configurations.
 
 | Metric | Baseline | Best | Config | Date |
 |--------|----------|------|--------|------|
-| tg32 (tok/s) | - | - | - | - |
+| tg32 (tok/s) | 32.14 | 32.14 | Upstream Baseline | 2026-01-09 |
 | tg128 (tok/s) | - | - | - | - |
-| pp2048 (tok/s) | - | - | - | - |
-| TTFT p50 (ms) | - | - | - | - |
+| pp2048 (tok/s) | 4340 | 4340 | Upstream Baseline | 2026-01-09 |
+| TTFT p50 (ms) | ~589 | ~589 | Upstream Baseline | 2026-01-09 |
 
 ---
 
-## Baseline (Marlin, No Spec Decode)
+## Upstream Baseline (vLLM main, No PR changes)
 
-**Status**: TODO - Run after branch setup
+**Status**: ✅ COMPLETE - 2026-01-09
+
+This is the TRUE baseline - upstream vLLM main without any PR #31740 changes.
 
 ### Environment
 ```yaml
-date: YYYY-MM-DD HH:MM:SS
-git_sha_vllm: <pending>
-git_sha_flashinfer: <pending>
-docker_image_hash: <pending>
-cuda_version: <pending>
-driver_version: <pending>
-cudnn_version: <pending>
-gpu_clocks: default
-gpu_power_mode: default
+date: 2026-01-09 16:25:01
+git_sha_vllm: ac9f9330e (upstream/main)
+git_sha_flashinfer: bd2b033f (upstream/main)
+cuda_version: (NGC 25.12)
+gpu: NVIDIA GB10 (SM121)
 ```
 
 ### vLLM Configuration
@@ -39,60 +37,88 @@ tensor_parallel_size: 1
 max_model_len: 131072
 max_num_seqs: 2
 max_num_batched_tokens: 8192
-enforce_eager: false  # CUDA graphs enabled
+enforce_eager: true
 enable_prefix_caching: true
 load_format: fastsafetensors
 served_model: openai/gpt-oss-120b
 
 env_vars:
-  VLLM_MXFP4_MOE_KERNEL: marlin
-  VLLM_ATTENTION_BACKEND: FLASHINFER
-  VLLM_USE_CUDA_GRAPH: 1
+  VLLM_ATTENTION_BACKEND: (unset - auto)
+```
+
+### Observed Runtime Configuration
+```yaml
+# From vLLM logs:
+attention_backend: TRITON_ATTN  # NOT FlashInfer!
+moe_kernel: Marlin
+fp4_mode: "Weight-only FP4 compression" (not native SM121)
 ```
 
 ### Workload Parameters
 ```yaml
-prompt_length: 2048  # tokens
-output_lengths: [32, 128]
+prompt_length: 2048
+output_lengths: [32]
 batch_size: 1
 concurrency: 1
-temperature: 1.0
-top_p: 1.0
-top_k: 0
-seed: 42
-tokenizer: openai/gpt-oss-120b
-warmup_requests: 3
 test_requests: 10
+tool: llama-benchy 0.1.1
+latency_mode: generation
 ```
 
 ### Results
 ```yaml
-startup_time_s: <pending>
+throughput:
+  pp2048_tps: 4340.18 ± 818.53
+  tg32_tps: 32.14 ± 0.06
 
+latency:
+  ttfr_ms: 493.88 ± 166.12
+  est_ppt_ms: 432.84 ± 166.12
+  e2e_ttft_ms: 588.74 ± 161.70
+```
+
+### Key Findings
+
+1. **Attention**: Using `TRITON_ATTN`, NOT FlashInfer
+2. **MoE**: Using Marlin kernel
+3. **FP4**: Weight-only compression, NOT native SM121 FP4 compute
+4. **Warning**: "Your GPU does not have native support for FP4 computation"
+
+This confirms PR #31740 is needed to enable:
+- FlashInfer attention backend
+- CUTLASS MoE kernels
+- Native SM121 FP4 path
+
+---
+
+## Baseline with PR #31740 (Marlin, No Spec Decode)
+
+**Status**: TODO - Run next
+
+### Environment
+```yaml
+date: <pending>
+git_sha_vllm: 77bf5a554 (pr-31740 / mxfp4_v2)
+git_sha_flashinfer: bd2b033f (upstream/main)
+```
+
+### Expected Changes from Upstream
+- FlashInfer attention enabled
+- CUTLASS MoE available
+- Native SM121 FP4 path
+
+### Results
+```yaml
 throughput:
   pp2048_tps: <pending>
   tg32_tps: <pending>
   tg128_tps: <pending>
-
-latency:
-  ttft_p50_ms: <pending>
-  ttft_p99_ms: <pending>
-  tpot_p50_ms: <pending>
-  tpot_p99_ms: <pending>
-  itl_p50_ms: <pending>
-  itl_p99_ms: <pending>
-  e2e_p50_ms: <pending>
-  e2e_p99_ms: <pending>
-
-resource:
-  gpu_memory_peak_gb: <pending>
-  cpu_usage_percent: <pending>
 ```
 
 ### Kernel Validation
 ```yaml
 expected_kernels:
-  - marlin_*
+  - marlin_* OR cutlass_*
 observed_kernels: <pending>
 validation: PENDING
 ```
@@ -101,14 +127,18 @@ validation: PENDING
 
 ## Comparison Matrix
 
-| Config | tg32 | tg128 | pp2048 | TTFT p50 | TTFT p99 | Memory |
-|--------|------|-------|--------|----------|----------|--------|
-| Baseline (Marlin) | - | - | - | - | - | - |
-| CUTLASS GEMM | - | - | - | - | - | - |
-| CUTLASS + MXFP8 | - | - | - | - | - | - |
-| + Eagle3 short | - | - | - | - | - | - |
-| + Eagle3 long | - | - | - | - | - | - |
-| + Eagle3 throughput | - | - | - | - | - | - |
+| Config | tg32 | tg128 | pp2048 | TTFT p50 | Notes |
+|--------|------|-------|--------|----------|-------|
+| **Upstream Baseline** | **32.14** | - | **4340** | ~589ms | TRITON_ATTN, Marlin, no native FP4 |
+| PR #31740 Baseline | - | - | - | - | TODO |
+| CUTLASS GEMM | - | - | - | - | TODO |
+| CUTLASS + MXFP8 | - | - | - | - | TODO |
+| + Eagle3 short | - | - | - | - | TODO |
+| + Eagle3 long | - | - | - | - | TODO |
+| + Eagle3 throughput | - | - | - | - | TODO |
+| | | | | | |
+| **llama.cpp** | **57.85** | - | 2449 | - | Target |
+| **SGLang** | **52.37** | - | - | 49.87ms | Target |
 
 ---
 
