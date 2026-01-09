@@ -179,6 +179,49 @@ Need FlashInfer `mxfp4_wip` branch with SM12x kernels.
 
 ---
 
+## Eagle3 Speculative Decoding (Baseline Config)
+
+**Status**: ✅ COMPLETE - 2026-01-09
+
+Testing Eagle3 with baseline backends (Marlin + TRITON_ATTN) to establish Eagle3 baseline.
+
+### Configuration
+```yaml
+attention_backend: TRITON_ATTN
+moe_kernel: marlin (via VLLM_MXFP4_MOE_KERNEL=marlin)
+speculative_config:
+  method: eagle3
+  num_speculative_tokens: 3
+```
+
+### Results
+
+| Eagle3 Model | tg32 (tok/s) | pp2048 (tok/s) | Acceptance Rate |
+|--------------|--------------|----------------|-----------------|
+| **short-context** | 13.97 ± 0.08 | 5153 ± 455 | ~31% |
+| **long-context** | 14.42 ± 0.09 | 5193 ± 465 | ~31% |
+| **throughput** | 14.71 ± 0.07 | 5241 ± 395 | ~31% |
+| *Baseline (no spec)* | *31.6* | *4341* | *N/A* |
+
+### Analysis
+
+**Eagle3 with baseline config is 2x SLOWER than no speculation!**
+
+| Metric | No Spec | With Eagle3 | Delta |
+|--------|---------|-------------|-------|
+| tg32 | 31.6 tok/s | 14.4 tok/s | **-54%** |
+
+**Root Cause**: ~31% draft acceptance rate (should be 60-70%+)
+- Per-position acceptance: 0.55, 0.27, 0.13 (very low)
+- Drafted tokens are being rejected, wasting compute
+
+**Hypothesis**: Eagle3 was trained with different numerical characteristics than Marlin + TRITON_ATTN produces. The FlashInfer + CUTLASS backends (used in mxfp4_wip where 61 tok/s was achieved) likely have outputs that match better.
+
+### Next Steps
+Port FlashInfer sink support from mxfp4_wip to enable FlashInfer attention, then re-test Eagle3.
+
+---
+
 ## Comparison Matrix
 
 | Config | tg32 | tg128 | tg256 | pp2048 | TTFT p50 | Notes |
@@ -186,6 +229,9 @@ Need FlashInfer `mxfp4_wip` branch with SM12x kernels.
 | **Upstream Baseline** | **31.6** | **31.6** | **31.1** | **4341** | ~555ms | TRITON_ATTN, Marlin, no native FP4 |
 | **PR #31740 + Baseline** | **31.9** | - | - | **4702** | ~579ms | Same backends, parity confirmed |
 | PR #31740 Native | - | - | - | - | - | Blocked on FlashInfer SM12x |
+| **Eagle3 short-context** | **14.0** | - | - | 5153 | ~662ms | 31% acceptance rate - REGRESSION |
+| **Eagle3 long-context** | **14.4** | - | - | 5193 | ~577ms | 31% acceptance rate - REGRESSION |
+| **Eagle3 throughput** | **14.7** | - | - | 5241 | ~655ms | 31% acceptance rate - REGRESSION |
 | CUTLASS GEMM | - | - | - | - | - | TODO |
 | CUTLASS + MXFP8 | - | - | - | - | - | TODO |
 | + Eagle3 short | - | - | - | - | - | TODO |
