@@ -112,7 +112,7 @@ RUN mkdir -p /workspace/vllm /workspace/flashinfer
 
 RUN --mount=type=cache,id=tiktoken-cache,target=/tiktoken-cache \
     mkdir -p /workspace/tiktoken_encodings && \
-    if [ ! -f "/tiktoken-cache/o200k_base.tiktoken" ]; then \
+    if [ ! -f "/tiktoken-cache/o200k_base.tiktoken" ] || [ ! -f "/tiktoken-cache/cl100k_base.tiktoken" ]; then \
         echo "=== Cache miss: Downloading tiktoken encodings ===" && \
         wget -q -O /tiktoken-cache/o200k_base.tiktoken \
             "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" && \
