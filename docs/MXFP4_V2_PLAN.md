@@ -34,6 +34,123 @@ Make **vLLM the fastest inference engine for gpt-oss-120b** on NVIDIA GB10 (SM12
 
 ---
 
+## Success Criteria (Define "Done")
+
+| Level | tg32 Target | Status | What It Means |
+|-------|-------------|--------|---------------|
+| **Minimum** | ≥52 tok/s | ⏳ | Beat SGLang |
+| **Target** | ≥58 tok/s | ⏳ | Match llama.cpp |
+| **Stretch** | ≥61 tok/s | ⏳ | Confirm Eagle3 result from WIP |
+
+**Hard Constraints:**
+- Prefill must stay ≥4500 tok/s (no regression)
+- TTFT p99 must stay ≤1000ms
+- No crashes in 100-request stress test
+- Must work with CUDA graphs OR have documented reason why not
+
+**Known Win to Preserve:**
+Previous `mxfp4_wip` showed Eagle3 + `--enforce-eager` achieved **61 tok/s** on tg128. This MUST be verified on fresh branches before deep optimization work.
+
+---
+
+## Phase 0: Baseline Profiling (DO THIS FIRST)
+
+**Before porting ANY features**, understand where time actually goes.
+
+### Step 0.1: Verify Current Kernel Path
+
+```bash
+# Start vLLM with upstream defaults
+docker compose -f docker-compose.dev.yml up -d
+docker exec -it vllm-dev bash
+
+# Check which MoE kernel is actually used
+FLASHINFER_LOGLEVEL=3 python3 -c "
+import torch
+from vllm import LLM, SamplingParams
+
+llm = LLM(model='openai/gpt-oss-120b', quantization='mxfp4', 
+          tensor_parallel_size=1, enforce_eager=True)
+output = llm.generate(['Hello'], SamplingParams(max_tokens=10))
+" 2>&1 | grep -i "moe\|kernel\|marlin\|cutlass"
+```
+
+**Record:**
+- [ ] Which MoE kernel fires? (Marlin / CUTLASS / Triton)
+- [ ] Which attention backend? (FlashInfer FA2 / Flash Attention)
+- [ ] Any fallback warnings?
+
+### Step 0.2: Profile Decode Path with nsys
+
+```bash
+# Profile a decode workload (not prefill)
+nsys profile --stats=true -o baseline_decode \
+  python3 scripts/profile_decode_only.py \
+    --prompt-tokens 2048 \
+    --output-tokens 64 \
+    --model openai/gpt-oss-120b
+
+# Generate report
+nsys stats baseline_decode.nsys-rep --report gputrace > baseline_kernels.txt
+```
+
+**Record in `docs/analysis/VLLM_BASELINE_ANALYSIS.md`:**
+
+| Kernel Category | Time % | Avg (μs) | Calls/Token | Notes |
+|-----------------|--------|----------|-------------|-------|
+| MoE FC1 | ? | ? | 60 | |
+| MoE FC2 | ? | ? | 60 | |
+| Attention | ? | ? | ? | |
+| LayerNorm | ? | ? | ? | |
+| Quantization | ? | ? | ? | |
+| Other | ? | ? | ? | |
+
+### Step 0.3: Verify Eagle3 Still Works
+
+```bash
+# Test Eagle3 speculative decoding (known to work in WIP)
+vllm serve openai/gpt-oss-120b \
+    --quantization mxfp4 \
+    --speculative-config '{"method": "eagle3", "model": "nvidia/gpt-oss-120b-Eagle3-short-context", "num_speculative_tokens": 3}' \
+    --enforce-eager \
+    --tensor-parallel-size 1 \
+    --max-model-len 8192
+
+# Benchmark
+llama-benchy --model gpt-oss-120b --endpoint http://localhost:8000 \
+    --prompt-length 2048 --output-lengths 32,128 --num-requests 5
+```
+
+**Record:**
+- [ ] Eagle3 works on fresh branches? YES / NO
+- [ ] tg32 with Eagle3: ___ tok/s
+- [ ] tg128 with Eagle3: ___ tok/s
+- [ ] Any crashes or errors?
+
+### Step 0.4: Decision Gate
+
+Based on profiling results, decide optimization priority:
+
+| If Profiling Shows... | Then Priority Is... |
+|-----------------------|---------------------|
+| MoE is >50% of decode time | Focus on MoE kernel (CUTLASS, tiles) |
+| Attention is >40% of decode time | Focus on attention optimization |
+| Quantization overhead >10% | Focus on activation persistence (MXFP8) |
+| Eagle3 already hits target | Focus on stability (CUDA graphs, sinks) |
+| Marlin is being used (not CUTLASS) | Investigate why, may need explicit override |
+
+### Phase 0 Deliverables
+
+Before proceeding to Phase 1:
+
+- [ ] `docs/analysis/VLLM_BASELINE_ANALYSIS.md` filled with actual data
+- [ ] `docs/perf_artifacts/baseline_decode.nsys-rep` captured
+- [ ] Kernel path verified and documented
+- [ ] Eagle3 status confirmed
+- [ ] Priority order validated or adjusted based on data
+
+---
+
 ## Phase 1: Backup Current Work
 
 Tag existing branches before starting fresh:
@@ -761,12 +878,28 @@ Use same format as llama.cpp and SGLang analyses for easy comparison.
 
 ## Next Steps (In Order)
 
-1. [ ] Run `scripts/setup_mxfp4_v2.sh` to create branches
-2. [ ] Document baseline with `scripts/collect_benchmark_metadata.sh`
-3. [ ] Run baseline benchmark with llama-benchy
-4. [ ] Create `docs/analysis/VLLM_BASELINE_ANALYSIS.md`
-5. [ ] Port first feature (CUTLASS GEMM) with critical review
-6. [ ] Repeat test protocol for each feature
+### Immediate (Phase 0 - Baseline Profiling)
+1. [ ] **Verify kernel path** - Which MoE kernel fires on SM121? (Marlin/CUTLASS/Triton)
+2. [ ] **Profile decode with nsys** - Capture `baseline_decode.nsys-rep`
+3. [ ] **Fill in VLLM_BASELINE_ANALYSIS.md** - Actual kernel breakdown, not placeholders
+4. [ ] **Verify Eagle3 works** - Confirm 61 tok/s result on fresh branches
+5. [ ] **Decision gate** - Validate or adjust feature priority based on data
+
+### Setup (Phase 1-2)
+6. [ ] Run `scripts/setup_mxfp4_v2.sh` to create branches (if not already done)
+7. [ ] Document baseline with `scripts/collect_benchmark_metadata.sh`
+
+### Feature Porting (Phase 5+)
+8. [ ] Port first feature based on profiling priority
+9. [ ] Run 6-level test protocol
+10. [ ] Critical review with hypothesis/success criteria
+11. [ ] Repeat for each feature
+
+### Success Checkpoints
+- [ ] **Checkpoint 1**: tg32 ≥ 40 tok/s (baseline + one optimization)
+- [ ] **Checkpoint 2**: tg32 ≥ 52 tok/s (beat SGLang - MINIMUM SUCCESS)
+- [ ] **Checkpoint 3**: tg32 ≥ 58 tok/s (match llama.cpp - TARGET)
+- [ ] **Checkpoint 4**: Stable with CUDA graphs (production-ready)
 
 ---
 
