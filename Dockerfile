@@ -189,42 +189,23 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     rm fastsafetensors.patch mxfp4_sm121.patch decorators_ngc.patch
 
 # =============================================================================
-# MXFP4 Configuration for SM121
+# Build-time Configuration for SM121
 # =============================================================================
 
-# MXFP4 backend selection for SM121:
-# - SM121 uses cuDNN backend for MXFP4 (requires cuDNN >= 9.14.0)
-# - CUTLASS backend on SM121 only supports NVFP4, not MXFP4
-# - TRTLLM backend is not supported on SM121
-
-# Use FlashInfer MXFP4 BF16 backend (cuDNN under the hood)
-ENV VLLM_USE_FLASHINFER_MOE_MXFP4_BF16=1
-
-# Disable MXFP8 backends (CUTLASS doesn't support MXFP4 on SM121)
-ENV VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=0
-ENV VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=0
-
-# FlashInfer MOE backend: "throughput" (CUTLASS) or "latency" (TRTLLM)
-ENV VLLM_FLASHINFER_MOE_BACKEND=throughput
-
-# Enable FlashInfer for FP4 MOE operations
-ENV VLLM_USE_FLASHINFER_MOE_FP4=1
-
-# =============================================================================
-# Performance tuning for DGX Spark
-# =============================================================================
-
-# Number of parallel JIT compilations
+# FlashInfer JIT compilation settings
 ENV FLASHINFER_NVCC_THREADS=4
-
-# vLLM performance settings
-ENV VLLM_ATTENTION_BACKEND=FLASHINFER
-
-# Enable CUDA graphs for better performance
-ENV VLLM_USE_CUDA_GRAPH=1
 
 # Target architecture for runtime
 ENV TORCH_CUDA_ARCH_LIST="12.1"
+
+# NOTE: vLLM runtime configuration (VLLM_*, attention backends, MoE kernels)
+# should be set at runtime via docker-compose.yml or command line.
+# This allows flexibility in testing different configurations.
+#
+# Example runtime configuration (set in docker-compose.yml or at startup):
+#   VLLM_MXFP4_MOE_KERNEL=marlin       # MoE kernel: auto, marlin, gemm, gemv, triton
+#   VLLM_ATTENTION_SINKS=false         # Sink control: auto, true, false
+#   --attention-config '{"backend": "TRITON_ATTN"}'  # Attention backend
 
 # =============================================================================
 # Tiktoken encodings (for tokenizer support)

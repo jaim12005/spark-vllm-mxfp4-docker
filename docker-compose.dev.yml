@@ -64,32 +64,16 @@ services:
       # preserves any existing PYTHONPATH from the image (requires modern docker compose).
       - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
       
-      # vLLM PR branch for SM121/Blackwell support
-      - VLLM_PR_NUMBER=31740
-      - VLLM_REF=pr-31740
-      
-      # MXFP4 configuration
-      - VLLM_USE_FLASHINFER_MOE_MXFP4_BF16=1
-      - VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=0
-      - VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=0
-      - VLLM_FLASHINFER_MOE_BACKEND=throughput
-      - VLLM_USE_FLASHINFER_MOE_FP4=1
-      
-      # Performance
-      - VLLM_ATTENTION_BACKEND=FLASHINFER
-      - VLLM_USE_CUDA_GRAPH=1
-      - FLASHINFER_NVCC_THREADS=4
-      - FLASHINFER_CUDA_ARCH_LIST=12.1a
-      
-      # Development - enable verbose logging for debugging
-      - FLASHINFER_LOGLEVEL=0
-      - FLASHINFER_JIT_VERBOSE=0
-      
       # Tiktoken encodings for tokenizer
       - TIKTOKEN_ENCODINGS_BASE=/workspace/tiktoken_encodings
       
       # Optional: HuggingFace token for gated models
       # - HF_TOKEN=${HF_TOKEN}
+      
+      # NOTE: vLLM runtime configuration (attention backends, MoE kernels, etc.)
+      # should be set explicitly when starting the server, not as default env vars.
+      # This allows flexibility in testing different configurations.
+      # Example: VLLM_MXFP4_MOE_KERNEL=marlin vllm serve ...
     
     # Default: start a shell
     command: /bin/bash
@@ -132,21 +116,12 @@ services:
     environment:
       # CRITICAL: Required for FlashInfer CUTLASS MoE to work with editable install
       - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
-      
-      # vLLM PR branch for SM121/Blackwell support
-      - VLLM_PR_NUMBER=31740
-      - VLLM_REF=pr-31740
-      
-      - VLLM_USE_FLASHINFER_MOE_MXFP4_BF16=1
-      - VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=0
-      - VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=0
-      - VLLM_FLASHINFER_MOE_BACKEND=throughput
-      - VLLM_USE_FLASHINFER_MOE_FP4=1
-      - VLLM_ATTENTION_BACKEND=FLASHINFER
-      - VLLM_USE_CUDA_GRAPH=1
-      - FLASHINFER_CUDA_ARCH_LIST=12.1a
-      - FLASHINFER_NVCC_THREADS=4
       - TIKTOKEN_ENCODINGS_BASE=/workspace/tiktoken_encodings
+      
+      # NOTE: Add vLLM runtime configuration here when needed
+      # Example:
+      # - VLLM_MXFP4_MOE_KERNEL=marlin
+      # - VLLM_ATTENTION_SINKS=false
     
     # Serve GPT-OSS-120B with MXFP4
     # NOTE: --enforce-eager is required until CUDA graph capture crash is fixed

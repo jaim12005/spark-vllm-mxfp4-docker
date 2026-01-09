@@ -226,31 +226,80 @@ Port FlashInfer sink support from mxfp4_wip to enable FlashInfer attention, then
 
 **Status**: ✅ COMPLETE - 2026-01-09
 
-Added `VLLM_IGNORE_SINK_VALIDATION=1` env var to allow testing different attention backends with sinks disabled.
+Added `VLLM_ATTENTION_SINKS` env var to control attention sink behavior for testing.
 
 ### Configuration
 ```yaml
 # Marlin + FLASH_ATTN (sinks disabled)
-env: VLLM_IGNORE_SINK_VALIDATION=1, VLLM_MXFP4_MOE_KERNEL=marlin
+env: VLLM_ATTENTION_SINKS=false, VLLM_MXFP4_MOE_KERNEL=marlin
 attention_config: {"backend": "FLASH_ATTN"}
 ```
 
 ### Results
 
-| Backend | tg32 (tok/s) | pp2048 (tok/s) | Notes |
+| Backend | tg32 (tok/s) | Output Quality | Notes |
 |---------|--------------|----------------|-------|
-| **TRITON_ATTN** (baseline) | **31.6** | **4341** | Works with sinks |
-| **FLASH_ATTN** (no sinks) | ~4-8 | ~400 | Very slow on SM121 |
+| **TRITON_ATTN** (sinks disabled) | **31.5** | ✅ Correct | Recommended fallback |
+| **FLASH_ATTN** (sinks disabled) | **31.9** | ❌ Garbage | Bug in FA2 path on SM121 |
+| **FLASHINFER** | N/A | N/A | Crashes (TllmGenFmhaRunner unsupported) |
 
 ### Analysis
 
-FLASH_ATTN with sinks disabled is **4-8x slower** than TRITON_ATTN on SM121. This is likely due to:
-1. FLASH_ATTN not optimized for SM121 architecture
-2. Missing native FP4/FP8 support in FLASH_ATTN
-3. TRITON_ATTN being the optimized fallback for this hardware
+Both TRITON_ATTN and FLASH_ATTN achieve ~32 tok/s with sinks disabled, but:
+- **TRITON_ATTN**: Produces correct output without sinks
+- **FLASH_ATTN**: Produces garbage output (bug in vLLM's FA2 implementation on SM121)
+
+The raw FA2 kernel is actually 2x faster than TRITON's unified_attention in microbenchmarks, but something in vLLM's FLASH_ATTN backend path corrupts the output.
+
+### Root Cause: Multiple Issues with FLASH_ATTN on SM121
+
+#### Issue 1: Non-standard Head Dimension
+
+gpt-oss-120b uses **head_dim=45** which is NOT in FA2's supported list:
+- FA2 supports: hdim32, 64, 96, 128, 160, 192, 256
+- **hdim45 is NOT supported!**
+
+Even with native SM121 FA2 kernels, the model's non-standard head dimension causes garbage output.
+TRITON_ATTN is more flexible and handles arbitrary head dims correctly.
+
+#### Issue 2: Dao-AILab flash-attention Lacks SM121 Support
+
+**This is a known issue**: [flash-attention#1969 - Support for compute capability 12.1 (sm121) - NVIDIA GB10 GPU](https://github.com/Dao-AILab/flash-attention/issues/1969)
+
+The vLLM FLASH_ATTN backend uses Dao-AILab's flash-attention library, which:
+- **Does NOT officially support SM121 (GB10 / DGX Spark)**
+- Only compiles kernels for SM80 (see `cuobjdump` output below)
+- Relies on PTX JIT compilation from SM80 → SM121 at runtime
+- PTX forward compatibility fails silently, producing numerically incorrect results
+
+```bash
+# Proof: vLLM FA2 binary only contains SM80 cubins
+$ cuobjdump -lelf /workspace/vllm/vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so
+ELF file    1: _vllm_fa2_C.abi3.1.sm_80.cubin
+ELF file    2: _vllm_fa2_C.abi3.2.sm_80.cubin
+... (all sm_80, no sm_120 or sm_121)
+```
+
+**Why SM121 can't be easily added**:
+The vLLM flash-attn source has **88 CUDA files hardcoded for SM80** (`*_sm80.cu`). Adding SM121 to CMakeLists only produces PTX from SM80 source, which JIT compiles incorrectly at runtime.
+
+```bash
+$ ls /workspace/vllm/.deps/vllm-flash-attn-src/csrc/flash_attn/src/*.cu | grep -oE 'sm[0-9]+' | sort -u
+sm80  # Only SM80 kernels exist!
+```
+
+**Workarounds**:
+1. Use **TRITON_ATTN** (works correctly on SM121)
+2. Use **FlashInfer backend** (has native SM121a JIT compilation with Blackwell-specific fixes)
+3. Wait for Dao-AILab to add SM121 support (open issue since Oct 2025)
 
 ### Conclusion
-For SM121, TRITON_ATTN is the best-performing fallback attention backend. FlashInfer with native FA2 and TRTLLM support (from mxfp4_wip) is needed to improve beyond baseline.
+For SM121 with gpt-oss-120b (head_dim=45):
+- Use **TRITON_ATTN** for correct output (handles non-standard head dims)
+- **FLASH_ATTN fails** due to unsupported head_dim=45, even with native SM121 build
+- **FlashInfer** (from mxfp4_wip with native FA2 sink support) is the path to 61+ tok/s
+
+**Note**: We built FA2 with native SM121 support (see `docs/FLASH_ATTN_SM121_BUILD.md`) and verified the kernel runs without NaN/Inf, but gpt-oss-120b's head_dim=45 is outside FA2's supported dimensions.
 
 ---
 
@@ -306,6 +355,91 @@ Each benchmark run should link to:
 | Run ID | Date | Config | tg32 | Notes |
 |--------|------|--------|------|-------|
 | baseline_upstream_v1 | 2026-01-09 | TRITON_ATTN + Marlin | 31.6 | nsys profile captured |
+
+---
+
+## Configuration Reference
+
+Environment variables and CLI arguments for consistent benchmarking.
+
+### vLLM Runtime Configuration
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `VLLM_MXFP4_MOE_KERNEL` | `auto`, `marlin`, `gemm`, `gemv`, `triton` | `auto` | MoE kernel selection. `marlin` for baseline, `gemm` for CUTLASS. |
+| `VLLM_ATTENTION_SINKS` | `auto`, `true`, `false` | `auto` | Attention sink control. `false` disables sinks for testing. |
+
+### Attention Backend Selection
+
+Use `--attention-config` CLI argument (not env var):
+
+```bash
+# TRITON_ATTN (baseline fallback)
+vllm serve ... --attention-config '{"backend": "TRITON_ATTN"}'
+
+# FLASH_ATTN (FlashAttention 2)
+vllm serve ... --attention-config '{"backend": "FLASH_ATTN"}'
+
+# FLASHINFER (requires SM12x kernel support)
+vllm serve ... --attention-config '{"backend": "FLASHINFER"}'
+```
+
+### FlashInfer Build Configuration
+
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `FLASHINFER_CUDA_ARCH_LIST` | `12.1a` | Target SM121 with FP4 hardware path |
+| `FLASHINFER_NVCC_THREADS` | `4` | Parallel JIT compilation threads |
+| `FLASHINFER_LOGLEVEL` | `0-5` | Logging verbosity (0=quiet) |
+| `FLASHINFER_JIT_VERBOSE` | `0/1` | JIT compilation logging |
+
+### Baseline Configuration
+
+For reproducible baseline benchmarks, use:
+
+```bash
+# Environment
+export VLLM_MXFP4_MOE_KERNEL=marlin
+unset VLLM_ATTENTION_BACKEND  # Don't use deprecated env var
+
+# Server command
+vllm serve openai/gpt-oss-120b \
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name gpt-oss-120b \
+    --quantization mxfp4 \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.70 \
+    --max-model-len 8192 \
+    --max-num-seqs 2 \
+    --enforce-eager \
+    --load-format fastsafetensors \
+    --attention-config '{"backend": "TRITON_ATTN"}'
+```
+
+### Testing Different Configurations
+
+```bash
+# Test with CUTLASS MoE (requires FlashInfer SM12x support)
+export VLLM_MXFP4_MOE_KERNEL=gemm
+
+# Test with sinks disabled (for Eagle3 or FlashInfer testing)
+export VLLM_ATTENTION_SINKS=false
+
+# Test with FlashInfer attention
+vllm serve ... --attention-config '{"backend": "FLASHINFER"}'
+```
+
+### Legacy Variables (Deprecated)
+
+These are no longer set by default in Docker configs:
+
+| Variable | Notes |
+|----------|-------|
+| `VLLM_ATTENTION_BACKEND` | Use `--attention-config` CLI instead |
+| `VLLM_USE_FLASHINFER_MOE_MXFP4_BF16` | Set in docker-compose.yml for production |
+| `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8` | Set in docker-compose.yml for production |
+| `VLLM_FLASHINFER_MOE_BACKEND` | Set in docker-compose.yml for production |
+| `VLLM_USE_CUDA_GRAPH` | Set in docker-compose.yml for production |
 
 ---
 
