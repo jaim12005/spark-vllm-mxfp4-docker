@@ -31,7 +31,7 @@ LABEL description="Development image for vLLM + FlashInfer iteration"
 # NOTE: CUTLASS kernel instantiations are very memory-hungry (5-10GB each).
 # With BUILD_JOBS=16, peak memory can exceed 100GB, causing OOM kills.
 # Use BUILD_JOBS=4 for fused MoE kernels, or set MAX_JOBS=4 at runtime.
-ARG BUILD_JOBS=4
+ARG BUILD_JOBS=16
 
 # =============================================================================
 # Build parallelism controls (conservative for ARM)

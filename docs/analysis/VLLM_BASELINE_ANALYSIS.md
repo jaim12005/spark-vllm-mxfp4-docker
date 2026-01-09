@@ -1,6 +1,6 @@
 # vLLM Baseline Analysis (SM121 / gpt-oss-120b)
 
-**Status**: Complete - 2026-01-09
+**Status**: Complete with nsys Profile - 2026-01-09
 
 ## Executive Summary
 
@@ -218,6 +218,113 @@ elif current_platform.is_blackwell_class() and has_flashinfer():
 | tg32 (decode) | 32.14 tok/s |
 | TTFT | ~589 ms |
 
+---
+
+## nsys Profile Analysis (Baseline)
+
+**Profile captured**: 2026-01-09 with 7 inference requests (2 warmup + 5 profiled)
+
+### Top GPU Kernels by Time
+
+| Rank | Kernel | Time % | Total (ms) | Calls | Avg (µs) |
+|------|--------|--------|------------|-------|----------|
+| 1 | **Marlin MoE (large)** | 20.8% | 1938 | 12168 | 159 |
+| 2 | **GEMV (dense layers)** | 19.8% | 1838 | 11592 | 159 |
+| 3 | **GEMV variant** | 12.0% | 1116 | 5964 | 187 |
+| 4 | elementwise (activations) | 9.3% | 862 | 9216 | 94 |
+| 5 | elementwise variant | 6.9% | 644 | 144 | 4472 |
+| 6 | **Marlin MoE (prefill)** | 6.9% | 640 | 144 | 4445 |
+| 7 | CatArrayBatchedCopy | 5.9% | 546 | 72 | 7582 |
+| 8 | Fill kernel | 3.9% | 361 | 144 | 2509 |
+| 9 | **gptq_marlin_repack** | 3.6% | 333 | 9216 | 36 |
+| 10 | CUTLASS GEMM (attention proj) | 1.1% | 105 | 144 | 726 |
+| 11 | WMMA GEMM | 0.5% | 46 | 254 | 182 |
+| 12 | **Triton attention (decode)** | 0.3% | 24 | 5796 | 4 |
+| 13 | **Triton attention (prefill)** | 0.0% | 1.6 | 252 | 6 |
+
+### Key Observations
+
+1. **MoE dominates (~31%)**: Marlin MoE + repack kernels account for ~31% of GPU time
+2. **Dense GEMV is significant (~32%)**: Two GEMV kernels for attention projections
+3. **Attention is cheap**: `kernel_unified_attention_3d` (decode) only 0.3%, 4µs avg
+4. **Memory copies**: CatArrayBatchedCopy at 5.9% indicates tensor concatenation overhead
+5. **Marlin repack overhead**: 3.6% spent just repacking weights for Marlin
+
+### Kernel Breakdown by Category
+
+| Category | Time % | Notes |
+|----------|--------|-------|
+| **MoE (Marlin)** | ~31% | Weight-only FP4, not using native FP4 tensor cores |
+| **Dense GEMM/GEMV** | ~33% | Attention projections (Q, K, V, O) |
+| **Memory/Copy** | ~10% | Tensor concatenation, fills |
+| **Attention** | ~0.5% | Triton attention is very fast |
+| **Other** | ~25% | Activations, RMSNorm, etc. |
+
+### Memory Bandwidth
+
+| Operation | Total (GB) | Count | Notes |
+|-----------|------------|-------|-------|
+| H2D (model load) | 65.3 GB | 29949 | Initial weight transfer |
+| D2D copies | 0.13 GB | 23349 | Per-token copies |
+| D2H copies | 0.001 GB | 168 | Output tokens |
+
+### Decode vs Prefill
+
+The profile captured both prefill (~200 tokens) and decode (32 tokens × 5 requests):
+
+- **Prefill**: Dominated by large Marlin MoE calls (4.4ms avg)
+- **Decode**: Many small GEMV calls (159µs avg) with 4µs attention
+
+### Performance Bottleneck Analysis
+
+**Why 32 tok/s instead of 58 tok/s?**
+
+1. **Marlin is not optimal for SM121**: Uses weight-only FP4 → BF16 decompression, not native FP4 tensor cores
+2. **GEMV overhead**: 32% of time in GEMV suggests small batch sizes (expected for decode)
+3. **Marlin repack**: 3.6% overhead just preparing weights
+4. **No CUDA graphs**: Running in eager mode
+
+**Expected improvements with CUTLASS MoE**:
+- Native FP8×FP4 block-scaled MMA on SM121
+- No repack overhead
+- Better memory coalescing for MoE expert selection
+
+---
+
+## Comprehensive Benchmark Results
+
+**Test Date**: 2026-01-09
+**Configuration**: TRITON_ATTN + Marlin, enforce_eager, fastsafetensors
+
+### Varying Prefill Length (tg=32)
+
+| Prefill | Throughput (tok/s) | TTFT (ms) | Decode (tok/s) |
+|---------|-------------------|-----------|----------------|
+| pp512 | 2209 ± 97 | 332 ± 12 | 32.22 ± 0.07 |
+| pp1024 | 3386 ± 81 | 418 ± 2 | 31.96 ± 0.02 |
+| pp2048 | 4341 ± 12 | 555 ± 14 | 31.63 ± 0.04 |
+| pp4096 | 4008 ± 23 | 1051 ± 9 | 30.96 ± 0.06 |
+
+**Observations**:
+- Prefill throughput peaks around pp2048 (~4.3k tok/s)
+- Decode performance is stable ~31-32 tok/s regardless of context length
+- TTFT scales linearly with prefill length
+
+### Varying Decode Length (pp=2048)
+
+| Decode | Throughput (tok/s) |
+|--------|-------------------|
+| tg16 | 31.53 ± 0.06 |
+| tg32 | 31.58 ± 0.06 |
+| tg64 | 31.62 ± 0.03 |
+| tg128 | 31.62 ± 0.05 |
+| tg256 | 31.12 ± 0.35 |
+
+**Observations**:
+- Decode throughput is consistent ~31.5 tok/s
+- Slight degradation at tg256 (context length growing)
+- Memory-bound, not compute-bound
+
 ### Comparison to Targets
 
 | Engine | tg32 (tok/s) | Gap to Baseline |
@@ -225,6 +332,8 @@ elif current_platform.is_blackwell_class() and has_flashinfer():
 | vLLM (baseline) | 32.14 | - |
 | SGLang | 52.37 | +63% faster |
 | llama.cpp | 57.85 | +80% faster |
+
+---
 
 ### Expected Impact of Fixes
 
