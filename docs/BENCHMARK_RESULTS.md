@@ -222,6 +222,38 @@ Port FlashInfer sink support from mxfp4_wip to enable FlashInfer attention, then
 
 ---
 
+## Attention Backend Testing (Sinks Disabled)
+
+**Status**: ✅ COMPLETE - 2026-01-09
+
+Added `VLLM_IGNORE_SINK_VALIDATION=1` env var to allow testing different attention backends with sinks disabled.
+
+### Configuration
+```yaml
+# Marlin + FLASH_ATTN (sinks disabled)
+env: VLLM_IGNORE_SINK_VALIDATION=1, VLLM_MXFP4_MOE_KERNEL=marlin
+attention_config: {"backend": "FLASH_ATTN"}
+```
+
+### Results
+
+| Backend | tg32 (tok/s) | pp2048 (tok/s) | Notes |
+|---------|--------------|----------------|-------|
+| **TRITON_ATTN** (baseline) | **31.6** | **4341** | Works with sinks |
+| **FLASH_ATTN** (no sinks) | ~4-8 | ~400 | Very slow on SM121 |
+
+### Analysis
+
+FLASH_ATTN with sinks disabled is **4-8x slower** than TRITON_ATTN on SM121. This is likely due to:
+1. FLASH_ATTN not optimized for SM121 architecture
+2. Missing native FP4/FP8 support in FLASH_ATTN
+3. TRITON_ATTN being the optimized fallback for this hardware
+
+### Conclusion
+For SM121, TRITON_ATTN is the best-performing fallback attention backend. FlashInfer with native FA2 and TRTLLM support (from mxfp4_wip) is needed to improve beyond baseline.
+
+---
+
 ## Comparison Matrix
 
 | Config | tg32 | tg128 | tg256 | pp2048 | TTFT p50 | Notes |
