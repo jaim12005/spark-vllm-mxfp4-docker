@@ -282,6 +282,112 @@ print(f'Family 120: {current_platform.is_device_capability_family(120)}')
 
 ---
 
+## Data Representation
+
+### MXFP4 Weight Format
+
+From `mxfp4.py:270-275` and MX spec:
+
+| Component | Format | Size | Description |
+|-----------|--------|------|-------------|
+| **Weight data** | E2M1 (4-bit) | 2 elements/byte | Packed FP4 nibbles |
+| **Block scale** | E8M0 (8-bit) | 1 byte/32 elements | Shared exponent per block |
+| **Block size** | 32 elements | - | MX format standard |
+
+```python
+# Weight tensor shapes (from create_weights):
+w13_weight: [num_experts, 2*intermediate_size, hidden_size//2]  # dtype=uint8
+w13_weight_scale: [num_experts, 2*intermediate_size, hidden_size//32]  # dtype=uint8
+```
+
+### Activation Quantization by Backend
+
+| Backend | Activation Input | Quantization | Notes |
+|---------|-----------------|--------------|-------|
+| **Marlin** | BF16 | None | Weight-only FP4, activations stay BF16 |
+| **SM100_FI_MXFP4_BF16** | BF16 | None | BF16 activations into FP4 weights |
+| **SM100_FI_MXFP4_MXFP8** | BF16→MXFP8 | `mxfp8_quantize()` | Activations quantized to MXFP8 |
+| **SM100_FI_MXFP4_MXFP8_CUTLASS** | BF16→MXFP8 | `mxfp8_quantize(x, True, 32)` | Block size 32 |
+
+From `mxfp4.py:996-998`:
+```python
+# MXFP8 activation quantization (when enabled)
+from flashinfer import mxfp8_quantize
+x_quant, x_scale = mxfp8_quantize(x, True, 32)  # rowwise=True, block_size=32
+```
+
+---
+
+## Attention Sinks in gpt-oss-120b
+
+### What Are Attention Sinks?
+
+Attention sinks are learned parameters that help stabilize attention patterns, particularly for long sequences. They act as "anchor" positions that prevent attention drift.
+
+### Implementation in gpt-oss
+
+From `vllm/model_executor/models/gpt_oss.py:88-127`:
+
+```python
+class OAIAttention(nn.Module):
+    def __init__(self, ...):
+        # Per-head learned sink parameters
+        self.sinks = torch.nn.Parameter(
+            torch.empty(config.num_attention_heads // tp_size, requires_grad=False)
+        )
+        
+        self.attn = Attention(
+            ...,
+            sinks=self.sinks,  # Passed to attention layer
+        )
+```
+
+### Why This Matters
+
+1. **Backend requirement**: Any attention backend must support `has_sink=True`
+2. **FlashInfer limitation**: Only supports sinks via TRTLLM attention (SM100 only in upstream)
+3. **TRITON_ATTN fallback**: Always claims `supports_sink()=True`, but may not use them optimally
+
+---
+
+## KV Cache Layout
+
+### HND vs NHD
+
+| Layout | Order | When Used |
+|--------|-------|-----------|
+| **HND** | [num_heads, num_tokens, head_dim] | Blackwell-class (SM10x, SM12x) |
+| **NHD** | [num_tokens, num_heads, head_dim] | Other architectures |
+
+From `vllm/v1/attention/backends/flashinfer.py:374-382`:
+
+```python
+@classmethod
+def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
+    capability = current_platform.get_device_capability()
+    # Blackwell-class: SM10x, SM11x, SM12x (GB10)
+    if capability is not None and capability.major in (10, 11, 12):
+        return "HND"
+    return None
+```
+
+**Note**: PR #31740 already includes SM12x in the HND layout requirement.
+
+---
+
+## Padding Requirements by Backend
+
+From `mxfp4.py` `create_weights()`:
+
+| Backend | Intermediate Size | Hidden Size | Reason |
+|---------|-------------------|-------------|--------|
+| Marlin | round_up(n, 128) | round_up(n, 256) | Marlin kernel constraints |
+| SM100_FI_MXFP4_TRTLLM | round_up(n, 256) | round_up(n, 256) | TMA alignment |
+| SM100_FI_MXFP4_CUTLASS | round_up(n, 128) | round_up(n, 128) | CUTLASS tile size |
+| Triton | varies | varies | Platform-specific |
+
+---
+
 ## Source File References
 
 | File | Key Functions |
