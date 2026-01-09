@@ -124,16 +124,69 @@ vllm serve openai/gpt-oss-120b \
 
 ---
 
-## Phase 5: Features to Port (Priority Order)
+## Phase 5: Feature Porting Process
 
-| Priority | Feature | Hypothesis | Success Criteria |
-|----------|---------|------------|------------------|
-| 1 | **CUTLASS Grouped GEMM** | Faster than Marlin for MXFP4 on SM121 | ≥10% tg32 improvement |
-| 2 | **Runner/Setup Caching** | Reduce JIT and TTFT overhead | TTFT ≤ 500ms, startup ≤ 60s |
-| 3 | **Activation Quant (MXFP8)** | Reduce BF16→FP8 conversion overhead | ≥5% tg32 improvement |
-| 4 | **Tile Variants (64x128)** | Better M=1 efficiency | ≥5% tg32 improvement |
-| 5 | **Speculative Decoding** | Increase effective batch size | ≥50% tg32 improvement |
-| 6 | **Attention Sinks** | Long-context stability | No crashes, ≤3% perf regression |
+### CRITICAL REVIEW REQUIREMENT
+
+Every feature porting attempt MUST include a critical review of the implementation:
+
+1. **Question assumptions** - Why was it done this way? Is there a better approach?
+2. **Identify inefficiencies** - Memory access patterns, kernel launches, data copies
+3. **Note alternative approaches** - What else could be tried?
+4. **Document upstream TODOs** - Are there related improvements in FlashInfer?
+5. **Suggest experiments** - What benchmarks would validate improvements?
+
+### Porting Process (Step by Step)
+
+For each feature:
+
+```bash
+# 1. CREATE feature branch
+git checkout -b feature/X mxfp4_v2
+
+# 2. REVIEW the WIP implementation
+# Read the code carefully, understand what it does and why
+
+# 3. CRITICAL REVIEW (MANDATORY)
+# Document in docs/porting/FEATURE_X.md:
+# - What does this implementation do?
+# - What are its limitations?
+# - What assumptions does it make?
+# - Are there better approaches?
+# - What upstream TODOs relate to this?
+# - What experiments could improve it?
+
+# 4. CHERRY-PICK minimal changes
+# - Add proper env var gating
+# - Ensure feature can be disabled
+# - MUST NOT break existing feature combinations
+
+# 5. BENCHMARK
+# - Test with feature ON and OFF
+# - Test in combination with previously merged features
+# - Verify baseline still works unchanged
+# - Record in BENCHMARK_RESULTS.md
+
+# 6. STRUCTURED TESTING (see Testing Protocol)
+# - Run full test suite for this feature
+# - Document results in TEST_LOGS/
+
+# 7. DECISION
+# - If all tests pass: Merge to mxfp4_v2
+# - If any test fails: Keep on branch, document failure
+# - Either way: Keep critical review notes and test results
+```
+
+### Features to Port (Priority Order)
+
+| Priority | Feature | Hypothesis | Success Criteria | Key Questions |
+|----------|---------|------------|------------------|---------------|
+| 1 | **CUTLASS Grouped GEMM** | Faster than Marlin for MXFP4 on SM121 | ≥10% tg32 improvement | Is runner caching implemented? Can setup be cached? |
+| 2 | **Runner/Setup Caching** | Reduce JIT and TTFT overhead | TTFT ≤ 500ms, startup ≤ 60s | How much JIT overhead? |
+| 3 | **Activation Quant (MXFP8)** | Reduce BF16→FP8 conversion overhead | ≥5% tg32 improvement | Is quantization fused or separate kernel? |
+| 4 | **Tile Variants (64x128)** | Better M=1 efficiency | ≥5% tg32 improvement | Is PingPong dispatch implemented? Scale granularity? |
+| 5 | **Speculative Decoding** | Increase effective batch size | ≥50% tg32 improvement | Test all 3: short-context, long-context, throughput |
+| 6 | **Attention Sinks** | Long-context stability | No crashes, ≤3% perf regression | Why does it crash on SM121? Kernel issue? |
 
 ### Dependency Graph
 
@@ -163,18 +216,21 @@ Activation MXFP8 (P3) ──→ Tile Variants (P4)
 
 After each feature implementation, run these levels:
 
-### Level 1: Smoke Test
+### Level 1: Smoke Test (Boot Check)
 ```bash
-# Boot and basic inference
 scripts/test_level1_smoke.sh
 ```
-- Server starts without crash
-- Single inference request succeeds
-- Expected kernel logs appear
+Tests:
+- [ ] Server starts with feature enabled
+- [ ] Server starts with feature disabled (baseline still works)
+- [ ] No Python import errors
+- [ ] No CUDA initialization errors
+- [ ] JIT compilation completes (if applicable)
+
+**Pass criteria**: Server reaches "ready" state within 5 minutes
 
 ### Level 1.5: Kernel Path Validation (GATE)
 ```bash
-# Verify correct kernels are engaged
 scripts/test_level1.5_kernel_validation.sh
 ```
 
@@ -189,50 +245,254 @@ scripts/test_level1.5_kernel_validation.sh
 
 **If validation fails, benchmark results are INVALID.**
 
-### Level 2: Correctness
+### Level 2: Correctness Test (Output Validation)
 ```bash
 scripts/test_level2_correctness.sh
 ```
-- Output matches reference (perplexity within tolerance)
-- No NaN/Inf in outputs
-- Token-by-token comparison on fixed seed
+Tests:
+- [ ] Single prompt returns coherent text
+- [ ] Token count matches expectation (no truncation bugs)
+- [ ] No NaN/Inf in outputs
+- [ ] Logprobs are valid (if enabled)
+- [ ] Deterministic with same seed
 
-### Level 3: Stress Test
+**Pass criteria**: All outputs pass sanity checks
+
+### Level 3: Stress Test (Stability)
 ```bash
 scripts/test_level3_stress.sh
 ```
-- 100 sequential requests
-- Concurrent requests (2-4)
-- Long context (32K+ tokens)
-- No OOM or crashes
+Tests:
+- [ ] 100 sequential requests without crash
+- [ ] 10 concurrent requests without crash
+- [ ] Long generation (1024+ tokens) completes
+- [ ] Memory usage stable (no leaks over 100 requests)
+- [ ] No zombie processes after completion
+
+**Pass criteria**: All requests complete, memory delta < 10%
 
 ### Level 4: Performance Benchmark
 ```bash
 scripts/test_level4_benchmark.sh
 ```
-- Run llama-benchy with full metadata collection
-- Record pp2048, tg32, tg128
-- Capture p50/p99 TTFT, TPOT, ITL
+Tests:
+- [ ] pp2048 throughput (prefill)
+- [ ] tg32 throughput (decode)
+- [ ] tg128 throughput (decode, longer)
+- [ ] TTFT (time to first token)
+- [ ] Compare to baseline configuration
 
-### Level 5: Regression Check
+**Pass criteria**: Results recorded in BENCHMARK_RESULTS.md
+
+### Level 5: Regression Test (Feature Combinations)
 ```bash
 scripts/test_level5_regression.sh
 ```
-- Compare against baseline
-- Flag if perf drops >3%
-- Flag if memory increases >1GB
+Tests:
+- [ ] Baseline configuration still works
+- [ ] All previously merged features still work
+- [ ] New feature + each prior feature individually
+- [ ] Performance within 5% of previous measurements
 
-### Level 6: Combinatorial Matrix
+**Pass criteria**: No regressions detected
+
+### Level 6: Combinatorial Test (Full Matrix)
 ```bash
 scripts/test_level6_matrix.sh
 ```
-- Test feature combinations
-- Ensure orthogonal gating works
-- No feature interference
+Tests:
+- [ ] New feature × all kernel options
+- [ ] New feature × all activation options
+- [ ] New feature × speculation on/off
+- [ ] New feature × CUDA graphs on/off
+- [ ] Record any incompatible combinations
+
+**Pass criteria**: Document which combinations work/fail
+
+### Test Log Template
+
+Create `docs/TEST_LOGS/FEATURE_<name>_<date>.md`:
+
+```markdown
+# Test Log: [Feature Name]
+
+Date: YYYY-MM-DD
+Branch: feature/X
+
+## Level 1: Smoke Test
+- [ ] PASS / FAIL
+- Duration: Xm Ys
+- Notes:
+
+## Level 1.5: Kernel Path Validation
+- [ ] PASS / FAIL / INVALID
+- Observed kernels:
+- Notes:
+
+## Level 2: Correctness Test
+- [ ] PASS / FAIL
+- Notes:
+
+## Level 3: Stress Test
+- [ ] PASS / FAIL
+- Memory before: X GB
+- Memory after: Y GB
+- Notes:
+
+## Level 4: Performance Benchmark
+
+| Metric | Baseline | This Feature | Delta |
+|--------|----------|--------------|-------|
+| pp2048 | | | |
+| tg32 | | | |
+| tg128 | | | |
+| TTFT p50 | | | |
+| TTFT p99 | | | |
+
+## Level 5: Regression Test
+- [ ] PASS / FAIL
+- Regressions found:
+
+## Level 6: Combinatorial Test
+
+| Combination | Status | Notes |
+|-------------|--------|-------|
+| + marlin | | |
+| + cutlass | | |
+| + eagle3-short | | |
+| + cuda graphs | | |
+
+## Overall Result
+- [ ] READY TO MERGE
+- [ ] NEEDS FIXES (list issues)
+- [ ] BLOCKED (reason)
+```
 
 ---
 
-## Phase 7: Benchmark Reproducibility Metadata
+## Phase 7: Orthogonal Feature Gating
+
+### CRITICAL REQUIREMENT: Feature Independence
+
+Each feature MUST be independently toggleable without affecting other features. This enables:
+
+- **Testing any combination** of features (2^N configurations)
+- **Isolating performance/stability impact** of each feature
+- **Regression testing** when adding new features
+- **A/B comparisons** between specific implementations
+
+### Design Principles
+
+1. **No Feature Coupling**: Enabling CUTLASS GEMM must not force a specific activation quantization
+2. **Graceful Fallback**: If a feature is disabled, the system falls back to baseline behavior
+3. **Combinatorial Testing**: `benchmark_matrix.py` will test the full feature matrix
+4. **Additive Changes Only**: New features add code paths, never remove existing ones
+
+### Environment Variables (Orthogonal Axes)
+
+```bash
+# Axis 1: MoE Kernel Selection
+VLLM_MXFP4_MOE_KERNEL: str = "auto"  # auto, marlin, cutlass, gemv, triton
+
+# Axis 2: Activation Quantization (independent of kernel)
+VLLM_MXFP4_ACTIVATION: str = "auto"  # auto, mxfp4, mxfp8, fp8, bf16
+
+# Axis 3: Tile Configuration (only affects CUTLASS path)
+FLASHINFER_MOE_TILE: str = "auto"  # auto, 128x128, 64x128
+
+# Axis 4: Attention Sinks (independent of MoE)
+VLLM_USE_ATTENTION_SINKS: str = "0"  # 0, 1
+
+# Axis 5: Speculative Decoding (independent of kernel/quant)
+# Eagle3 models: short-context, long-context, throughput
+# Configured via --speculative-config flag
+
+# Axis 6: CUDA Graphs (independent of everything)
+# Configured via --enforce-eager flag (graphs enabled by default)
+```
+
+### Feature Matrix Example
+
+Any combination should work:
+
+| Test | Kernel | Activation | Sinks | Spec | Graphs |
+|------|--------|------------|-------|------|--------|
+| Baseline | marlin | bf16 | off | off | on |
+| Test A | cutlass | mxfp8 | off | off | on |
+| Test B | cutlass | mxfp8 | on | off | on |
+| Test C | cutlass | mxfp8 | on | eagle3-short | off |
+| Test D | cutlass | mxfp8 | off | eagle3-long | on |
+| Test E | cutlass | mxfp8 | off | eagle3-throughput | on |
+| Test F | gemv | bf16 | off | off | on |
+
+### Implementation Pattern
+
+```python
+# Each feature checks its own env var, independent of others
+def get_moe_kernel():
+    kernel = os.getenv("VLLM_MXFP4_MOE_KERNEL", "auto")
+    if kernel == "auto":
+        return detect_best_kernel()  # Baseline-compatible default
+    return kernel
+
+def get_activation_quant():
+    quant = os.getenv("VLLM_MXFP4_ACTIVATION", "auto")
+    if quant == "auto":
+        return "bf16"  # Baseline-compatible default
+    return quant
+
+# Features compose independently
+kernel = get_moe_kernel()   # marlin, cutlass, gemv, triton
+quant = get_activation_quant()  # mxfp4, mxfp8, fp8, bf16
+# Both can be any valid combination
+```
+
+---
+
+## Phase 8: Engine Analysis Documents
+
+These analysis documents are critical references for optimization decisions:
+
+| Document | Purpose | Location |
+|----------|---------|----------|
+| `LLAMA_CPP_ANALYSIS.md` | How llama.cpp achieves 58 tok/s decode (DP4A GEMV, activation persistence) | `docs/analysis/` |
+| `SGLANG_ANALYSIS.md` | How SGLang achieves ~52 tok/s (scheduler, kernel choices) | `docs/analysis/` |
+| `VLLM_BASELINE_ANALYSIS.md` | Analyze what upstream vLLM does before our changes | `docs/analysis/` |
+
+### vLLM Baseline Analysis (To Create)
+
+Perform the same depth of analysis on upstream vLLM as we did for llama.cpp and SGLang:
+
+1. **Kernel Profiling** - nsys/ncu trace of decode path
+   - Which kernels are called?
+   - Time breakdown per kernel category (attention, MoE, LayerNorm, etc.)
+   - Memory bandwidth utilization
+
+2. **Data Flow Analysis**
+   - What dtype are activations at each layer?
+   - Where does quantization/dequantization happen?
+   - How many kernel launches per decode step?
+
+3. **Scheduler Analysis**
+   - How does the V1 scheduler work?
+   - What's the per-token Python overhead?
+   - How does batching affect decode?
+
+4. **Attention Analysis**
+   - Which attention backend is used by default?
+   - KV cache layout (HND vs NHD)?
+   - Page size and memory access patterns?
+
+5. **MoE Analysis** (for gpt-oss-120b)
+   - Which MoE kernel is used (Marlin, Triton, CUTLASS)?
+   - Expert routing overhead?
+   - Weight loading patterns?
+
+This analysis establishes our true baseline before any optimization work.
+
+---
+
+## Phase 9: Benchmark Reproducibility Metadata
 
 Every benchmark run MUST record:
 
@@ -307,7 +567,7 @@ resource:
 
 ---
 
-## Phase 8: FlashInfer Upstream TODOs
+## Phase 10: FlashInfer Upstream TODOs
 
 Improvement opportunities identified in FlashInfer (durable references):
 
@@ -321,7 +581,7 @@ Improvement opportunities identified in FlashInfer (durable references):
 
 ---
 
-## Phase 9: Critical Review Template
+## Phase 11: Critical Review Template
 
 For each ported feature, create `docs/porting/FEATURE_<name>.md`:
 
@@ -529,3 +789,46 @@ export FLASHINFER_MOE_TILE=64x128  # auto, 128x128, 64x128
 export FLASHINFER_LOGLEVEL=3
 export FLASHINFER_JIT_VERBOSE=1
 ```
+
+---
+
+## Reference Repositories
+
+| Repo | Location | Branch | Purpose |
+|------|----------|--------|---------|
+| vLLM | `~/projects/vllm` | `mxfp4_v2` | Main vLLM development |
+| FlashInfer | `~/projects/flashinfer` | `mxfp4_v2` | CUTLASS kernels |
+| WIP Reference | `mxfp4_wip` tags | - | Feature source for porting |
+| llama.cpp | `~/projects/llama.cpp` | `main` | Reference implementation |
+| SGLang | `~/projects/sglang` | `main` | Competing engine |
+| mxfp4 | `~/projects/ai/mxfp4` | `main` | This repo - Docker + benchmarking |
+
+---
+
+## Files to Create/Modify Summary
+
+| File | Status | Description |
+|------|--------|-------------|
+| `AGENTS.md` | ✅ Done | Mission, architecture, tools only |
+| `docs/MXFP4_V2_PLAN.md` | ✅ Done | This document |
+| `docs/BENCHMARK_RESULTS.md` | ✅ Done | Live benchmark tracking |
+| `docs/FEATURE_MATRIX.md` | ✅ Done | Feature status and env vars |
+| `docs/UPSTREAM_TODOS.md` | ✅ Done | FlashInfer improvement opportunities |
+| `docs/porting/FEATURE_TEMPLATE.md` | ✅ Done | Critical review template |
+| `docs/analysis/LLAMA_CPP_ANALYSIS.md` | ✅ Moved | llama.cpp kernel analysis |
+| `docs/analysis/SGLANG_ANALYSIS.md` | ✅ Done | SGLang analysis |
+| `docs/analysis/VLLM_BASELINE_ANALYSIS.md` | ⏳ TODO | Profile upstream vLLM decode path |
+| `docs/investigations/` | ✅ Done | Historical attempts (reference only) |
+| `docs/TEST_LOGS/` | ✅ Created | Directory for test log files |
+| `docs/perf_artifacts/` | ✅ Created | Directory for nsys/ncu artifacts |
+| `scripts/setup_mxfp4_v2.sh` | ✅ Done | Branch setup automation |
+| `scripts/benchmark_matrix.py` | ⏳ TODO | Systematic performance testing |
+| `scripts/test_level1_smoke.sh` | ⏳ TODO | Boot/startup verification |
+| `scripts/test_level1.5_kernel_validation.sh` | ⏳ TODO | Kernel path validation |
+| `scripts/test_level2_correctness.sh` | ⏳ TODO | Output validation |
+| `scripts/test_level3_stress.sh` | ⏳ TODO | Stability under load |
+| `scripts/test_level4_benchmark.sh` | ⏳ TODO | Performance measurement |
+| `scripts/test_level5_regression.sh` | ⏳ TODO | Regression detection |
+| `scripts/test_level6_matrix.sh` | ⏳ TODO | Combinatorial feature testing |
+| `scripts/collect_benchmark_metadata.sh` | ⏳ TODO | Reproducibility metadata |
+| `scripts/validate_kernel_path.py` | ⏳ TODO | Kernel path checker |
