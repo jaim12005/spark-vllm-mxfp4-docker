@@ -879,11 +879,11 @@ Use same format as llama.cpp and SGLang analyses for easy comparison.
 ## Next Steps (In Order)
 
 ### Immediate (Phase 0 - Baseline Profiling)
-1. [ ] **Verify kernel path** - Which MoE kernel fires on SM121? (Marlin/CUTLASS/Triton)
-2. [ ] **Profile decode with nsys** - Capture `baseline_decode.nsys-rep`
-3. [ ] **Fill in VLLM_BASELINE_ANALYSIS.md** - Actual kernel breakdown, not placeholders
-4. [ ] **Verify Eagle3 works** - Confirm 61 tok/s result on fresh branches
-5. [ ] **Decision gate** - Validate or adjust feature priority based on data
+1. [x] **Verify kernel path** - Marlin MoE, FlashInfer FA2 attention (2026-01-10)
+2. [x] **Profile decode with nsys** - Captured `marlin_flashinfer_profile.nsys-rep` (2026-01-10)
+3. [x] **Fill in VLLM_BASELINE_ANALYSIS.md** - Full kernel breakdown, attention is 1.5% (2026-01-10)
+4. [ ] **Verify Eagle3 works** - Tested but low acceptance rate (~5%), needs investigation
+5. [x] **Decision gate** - MoE (34%) and Dense GEMV (38%) are bottlenecks, NOT attention (1.5%)
 
 ### Setup (Phase 1-2)
 6. [ ] Run `scripts/setup_mxfp4_v2.sh` to create branches (if not already done)

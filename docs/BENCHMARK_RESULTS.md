@@ -122,6 +122,57 @@ This confirms PR #31740 is needed to enable:
 
 ---
 
+## nsys Kernel Profiling (Marlin + FlashInfer FA2)
+
+**Status**: ✅ COMPLETE - 2026-01-10
+
+Full nsys profiling to identify bottlenecks. See detailed analysis in `docs/analysis/VLLM_BASELINE_ANALYSIS.md`.
+
+### Configuration
+```yaml
+moe_kernel: marlin
+attention_backend: FLASHINFER (native CUTLASS FA2 on SM121)
+kv_cache_layout: HND
+prompt_tokens: 2048
+output_tokens: 64
+enforce_eager: true
+```
+
+### Key Findings
+
+**Attention is NOT the bottleneck.** FlashInfer attention accounts for only **1.5%** of GPU time.
+
+| Category | GPU Time % | Primary Kernels |
+|----------|------------|-----------------|
+| **Dense GEMV/GEMM** | **38.4%** | `gemvx::kernel`, `cutlass_80_tensorop` |
+| **MoE GEMM (Marlin)** | **33.6%** | `marlin_moe_wna16::Marlin` |
+| **Memory/Data Movement** | **12.4%** | `elementwise_kernel`, `CatArrayBatchedCopy` |
+| **Activations/Norms** | **3.1%** | `swigluoai`, `fused_add_rms_norm` |
+| **MoE Overhead** | **2.7%** | `marlin_repack`, `topkGatingSoftmax` |
+| **Attention** | **1.5%** | `BatchPrefillWithPagedKVCacheKernel` |
+| **Other** | **8.3%** | Various PyTorch ops |
+
+### Performance
+```yaml
+decode_throughput: 30.3 tok/s
+tokens_generated: 64
+runs: 3
+warmup: 2
+```
+
+### Optimization Priority (Based on Profile)
+
+1. **MoE GEMM** (34%): Test CUTLASS grouped GEMM vs Marlin
+2. **Dense GEMV** (38%): Consider quantized lm_head
+3. **Memory** (12%): MXFP8 persistent activations
+4. ~~Attention~~ (1.5%): **LOW PRIORITY** - already efficient
+
+### Artifacts
+- Profile: `docs/perf_artifacts/marlin_flashinfer_profile.nsys-rep`
+- Database: `docs/perf_artifacts/marlin_flashinfer_profile.sqlite`
+
+---
+
 ## PR #31740 with Baseline Config (Marlin + TRITON_ATTN)
 
 **Status**: ✅ COMPLETE - 2026-01-09
