@@ -241,7 +241,7 @@ attention_config: {"backend": "FLASH_ATTN"}
 |---------|--------------|----------------|-------|
 | **TRITON_ATTN** (env=false) | **31.5** | ✅ Correct | ⚠️ Sinks NOT actually disabled |
 | **FLASH_ATTN** (sinks disabled) | **31.9** | ❌ Garbage | Bug in FA2 path on SM121 |
-| **FLASHINFER** | N/A | N/A | Crashes (TllmGenFmhaRunner unsupported) |
+| **FLASHINFER** | **31.7** | ✅ Correct | Uses native FA2 sink module on SM121 |
 
 ### Analysis
 
@@ -602,3 +602,55 @@ Prompt: "The capital of France is"
 Without sinks: " a is the is a is the is a is the is a is the is a is the is"
 With sinks: " Paris.\n\nGreat! If you have any more questions or need further assistance, feel free to ask"
 ```
+
+---
+
+## FlashInfer Speculative Decoding Support (2026-01-10)
+
+### Problem
+
+FlashInfer backend failed with Eagle3 speculative decoding due to:
+```
+AssertionError: FlashInfer backend currently only supports models in which 
+all layers share the same values for: `window_left`, `logits_soft_cap`, `sm_scale`.
+```
+
+**Root cause**: Main model (gpt-oss-120b) and draft model (Eagle3) have different hyperparameters:
+- Main model: `window_left=128`, `has_sinks=True`
+- Draft model: `window_left=-1`, `has_sinks=False`
+
+### Solution: Per-Hyperparameter-Group Wrappers
+
+Implemented Option A: Create separate FlashInfer wrappers for each unique set of hyperparameters.
+
+**Changes**:
+1. `vllm/v1/attention/backends/utils.py`:
+   - Added `group_layers_by_hyperparameters()` to group layers with identical hyperparameters
+
+2. `vllm/v1/attention/backends/flashinfer.py`:
+   - Added `HyperparamKey` type alias
+   - Modified `FIPrefill` and `FIDecode` to store per-group wrappers
+   - Modified `FlashInferMetadataBuilder` to create wrappers per group
+   - Modified `FlashInferImpl.forward()` to look up correct wrapper by layer's hyperparameters
+
+### Results
+
+| Configuration | tg32 (tok/s) | tg64 (tok/s) | tg128 (tok/s) | Notes |
+|--------------|--------------|--------------|---------------|-------|
+| Baseline (no spec) | 32 | - | - | Marlin + TRITON_ATTN |
+| FlashInfer (no spec, with sinks) | 31.9 | - | 32.3 | Matches baseline |
+| **Eagle3-long + FlashInfer** | **19.1** | **20.5** | **22.1** | Speculative decoding working! |
+| Eagle3-long + TRITON_ATTN | ~24-25 | - | - | For comparison |
+
+### Key Findings
+
+1. **FlashInfer + Eagle3 speculative decoding now works** - No more assertion failures
+2. **Performance is similar to TRITON_ATTN** - Neither backend achieves the target 61 tok/s
+3. **Both backends are slower than no speculation** - Indicates low acceptance rate issue, not backend-specific
+4. **The 61 tok/s result from mxfp4_wip likely used different hyperparameters or model configuration**
+
+### Next Steps
+
+- Investigate why acceptance rate is low with both TRITON_ATTN and FlashInfer
+- Compare numerical outputs between backends to identify any precision mismatches
+- Test with BF16 (no quantization) to isolate MXFP4 as potential culprit
