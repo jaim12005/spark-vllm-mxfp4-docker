@@ -117,8 +117,14 @@ vllm serve openai/gpt-oss-120b \
     --max-model-len 8192
 
 # Benchmark
-llama-benchy --model gpt-oss-120b --endpoint http://localhost:8000 \
-    --prompt-length 2048 --output-lengths 32,128 --num-requests 5
+docker exec vllm-dev llama-benchy \
+  --base-url http://localhost:8000/v1 \
+  --model openai/gpt-oss-120b \
+  --served-model-name gpt-oss-120b \
+  --pp 2048 \
+  --tg 32 128 \
+  --runs 5 \
+  --no-cache
 ```
 
 **Record:**

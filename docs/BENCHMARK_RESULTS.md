@@ -705,3 +705,39 @@ Implemented Option A: Create separate FlashInfer wrappers for each unique set of
 - Investigate why acceptance rate is low with both TRITON_ATTN and FlashInfer
 - Compare numerical outputs between backends to identify any precision mismatches
 - Test with BF16 (no quantization) to isolate MXFP4 as potential culprit
+
+---
+
+## Native CUTLASS MXFP4×MXFP8 Investigation
+
+**Status**: ⚠️ CUTLASS NOT WORKING ON SM121 - 2026-01-10
+
+Attempted to compare native CUTLASS MXFP4 (FP8×FP4 tensor core MMA) vs Marlin.
+
+### CRITICAL FINDING
+
+**Native CUTLASS MXFP4×MXFP8 kernels do NOT work on SM121 (GB10)!**
+
+All CUTLASS tactics failed during autotuning with:
+```
+Unsupported tile (128, 128, 64) and cluster (1, 1, 1) shape combination for arch 120
+```
+
+The CUTLASS kernels were designed for **SM100**, not SM12x. When `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1` is set on SM121:
+1. FlashInfer autotuner tries 18 CUTLASS tactics → ALL FAIL
+2. Falls back to Marlin
+3. Benchmark results were Marlin vs Marlin (identical performance)
+
+### What Works on SM121
+
+| MoE Backend | Status | Performance |
+|-------------|--------|-------------|
+| **Marlin** | ✅ Working | 29.4 t/s decode |
+| **CUTLASS MXFP4×MXFP8** | ❌ Not Working | Falls back to Marlin |
+| **Triton** | ⏳ Untested | - |
+
+### Implications
+
+1. **No native FP4×FP8 MMA available for SM121** - must use Marlin's BF16 dequant path
+2. **FlashInfer needs SM12x-specific tile configurations** for native FP4 support
+3. **Profiling results remain valid** - Marlin was the MoE kernel in all tests

@@ -186,3 +186,57 @@ nsys profile -o /tmp/marlin_flashinfer_profile \
 - KV cache layout: HND
 - Attention backend: FlashInfer CUTLASS FA2
 - MoE kernel: Marlin
+
+---
+
+## Native CUTLASS MXFP4×MXFP8 Investigation (2026-01-10)
+
+Attempted to test native CUTLASS MXFP4 (FP8×FP4 tensor core MMA) vs Marlin (BF16 dequant).
+
+### CRITICAL FINDING: CUTLASS MXFP4 Does NOT Work on SM121
+
+**ALL CUTLASS tactics failed during autotuning:**
+
+```
+Unsupported tile (128, 128, 64) and cluster (1, 1, 1) shape combination for arch 120
+Unsupported tile (128, 256, 64) and cluster (1, 1, 1) shape combination for arch 120  
+Unsupported tile (256, 128, 64) and cluster (1, 1, 1) shape combination for arch 120
+```
+
+The CUTLASS MXFP4×MXFP8 kernels were designed for **SM100** (H100/B100), NOT SM12x (GB10).
+
+### What Actually Happened
+
+1. Set `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1`
+2. vLLM: `is_blackwell_class()` → True (SM121 is Blackwell family)
+3. FlashInfer autotuner tries CUTLASS tactics (1,2,3,5,6,7,9,10,11,13,14,15,17,18,19,21,22,23)
+4. **ALL 18 CUTLASS tactics FAIL** with "Unsupported tile/cluster for arch 120"
+5. Falls back to tactics 0,4,8,12,16,20 (likely Marlin)
+6. **We benchmarked Marlin the whole time!**
+
+### Results (Both Were Marlin)
+
+| "Backend" | pp2048 (t/s) | tg32 (t/s) | tg128 (t/s) |
+|-----------|--------------|------------|-------------|
+| **Marlin (explicit)** | ~4800 | 29.4 | 29.2 |
+| **"CUTLASS" (fell back to Marlin)** | 4802-4852 | **29.44** | **29.19** |
+
+Identical performance because both ran Marlin!
+
+### Implication
+
+**There is NO working native FP4×FP8 CUTLASS kernel for SM121 (GB10).**
+
+The only working MoE path on SM121 is:
+- **Marlin**: Dequantizes FP4→BF16 on-the-fly, uses BF16 tensor cores
+
+To get native FP4 MMA on SM121, FlashInfer needs SM12x-specific tile/cluster configurations.
+
+### Coherence Tests (Passed - with Marlin fallback)
+
+| Test | Input | Output |
+|------|-------|--------|
+| Geography | "The capital of France is" | "Paris" ✓ |
+| Math | "What is 25 + 37?" | "62" ✓ |
+| Science | "Water is made of two elements:" | "hydrogen and oxygen" ✓ |
+| Code | `def add(a, b):` | `return a + b` ✓ |
