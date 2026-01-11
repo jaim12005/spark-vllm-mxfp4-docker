@@ -4,7 +4,7 @@ Upstream:
   This bug would affect anyone using this code path with the current FlashInfer version. The mxfp4_wip branch correctly added None, # o_data_type to fix it.
 - Ensure non_blocking is a boolean (older PyTorch accepts None, newer versions don't) <- flashinfer
 - TRTLLM exclusion on sm121 for attention when using flashinfer backend
-- Fix to cutlass for LayoutSFB
+- issue report on the issue that caused the cutlass error
 
 Experiment:
 - Full-Scale Mode for SM12x Activation Quantization:
@@ -32,3 +32,6 @@ For the initial testing, this might be okay - we can start with the basic mode a
 - (EngineCore_DP0 pid=285379) DEBUG 01-10 18:05:25 [model_executor/.../quantization/mxfp4.py:370] MXFP4 linear layer is not implemented - falling back to UnquantizedLinearMethod.
 - (EngineCore_DP0 pid=285379) DEBUG 01-10 18:05:25 [model_executor/.../quantization/mxfp4.py:385] MXFP4 attention layer is not implemented. Skipping quantization for this layer.
 
+- add finalize fusion support
+- support swap?
+- configure the cutlass autotuner
