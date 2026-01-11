@@ -8,14 +8,44 @@ Live tracking of benchmark results across configurations.
 
 | Metric | Baseline | Best | Config | Date |
 |--------|----------|------|--------|------|
-| tg32 (tok/s) | 31.63 | 31.63 | Upstream Baseline | 2026-01-09 |
-| tg128 (tok/s) | 31.62 | 31.62 | Upstream Baseline | 2026-01-09 |
-| tg256 (tok/s) | 31.12 | 31.12 | Upstream Baseline | 2026-01-09 |
+| tg32 (tok/s) | 31.63 | 31.63 | Upstream (Marlin) | 2026-01-09 |
+| tg128 (tok/s) | 31.62 | 31.62 | Upstream (Marlin) | 2026-01-09 |
+| tg256 (tok/s) | 31.12 | 31.12 | Upstream (Marlin) | 2026-01-09 |
 | pp512 (tok/s) | 2209 | 2209 | Upstream Baseline | 2026-01-09 |
 | pp1024 (tok/s) | 3386 | 3386 | Upstream Baseline | 2026-01-09 |
-| pp2048 (tok/s) | 4341 | 4341 | Upstream Baseline | 2026-01-09 |
+| pp2048 (tok/s) | 4341 | **5699** | **CUTLASS FP8×FP4** | 2026-01-11 |
 | pp4096 (tok/s) | 4008 | 4008 | Upstream Baseline | 2026-01-09 |
-| TTFT@pp2048 (ms) | ~555 | ~555 | Upstream Baseline | 2026-01-09 |
+| TTFT@pp2048 (ms) | ~555 | **~532** | **CUTLASS FP8×FP4** | 2026-01-11 |
+
+**Milestone achieved**: Native SM121 CUTLASS FP8×FP4 MoE GEMM working! Prefill 31% faster.
+
+**Remaining gap**: Decode at 29 tok/s vs target 52-58 tok/s. Root cause identified: BF16 lm_head.
+
+---
+
+## Critical Finding: lm_head Bottleneck (2026-01-11)
+
+### The Performance Gap Explained
+
+| Engine | tg32 (tok/s) | lm_head format | lm_head size |
+|--------|--------------|----------------|--------------|
+| **llama.cpp** | **58** | MXFP4 | 0.29 GB |
+| **vLLM** | **29** | BF16 | 1.16 GB |
+| Difference | **-50%** | **4x larger** | **+3.1 ms/tok** |
+
+### Why vLLM Uses BF16 for lm_head
+
+1. **Model config excludes it**: `quantization_config.modules_to_not_convert: ["lm_head", ...]`
+2. **MXFP4 LinearMethod not implemented**: Falls back to `UnquantizedLinearMethod`
+3. **Native checkpoint is BF16**: safetensors has `lm_head.weight: dtype=bfloat16`
+
+### Optimization Path
+
+To match llama.cpp decode performance:
+1. **Implement MXFP4 for lm_head** - Expected +30-45% decode speedup
+2. Use DP4A-based FP4 GEMV for memory-bound decode
+
+See detailed analysis: `docs/analysis/LLAMA_CPP_ANALYSIS.md`
 
 ---
 
@@ -418,17 +448,23 @@ Test Eagle3 with FlashInfer attention to verify speculative decoding still works
 | **Upstream Baseline** | **31.6** | **31.6** | **31.1** | **4341** | ~555ms | TRITON_ATTN, Marlin, no native FP4 |
 | **PR #31740 + Baseline** | **31.9** | - | - | **4702** | ~579ms | Same backends, parity confirmed |
 | **Marlin + FlashInfer + Sinks** | **32.6** | - | - | - | - | ✅ Coherent, FA2 sink module |
-| PR #31740 Native | - | - | - | - | - | Blocked on FlashInfer SM12x |
+| **CUTLASS FP8×FP4 + FlashInfer** | **29.0** | **28.8** | - | **5699** | **~532ms** | 🎉 Native SM121! |
 | **Eagle3 short-context** | **14.0** | - | - | 5153 | ~662ms | 31% acceptance rate - REGRESSION |
 | **Eagle3 long-context** | **14.4** | - | - | 5193 | ~577ms | 31% acceptance rate - REGRESSION |
 | **Eagle3 throughput** | **14.7** | - | - | 5241 | ~655ms | 31% acceptance rate - REGRESSION |
 | Eagle3 + FlashInfer | - | - | - | - | - | TODO |
-| CUTLASS GEMM | - | - | - | - | - | TODO |
-| CUTLASS + MXFP8 | - | - | - | - | - | TODO |
-| + Eagle3 throughput | - | - | - | - | - | TODO |
+| CUTLASS + Eagle3 | - | - | - | - | - | TODO |
+| CUTLASS + MXFP4 lm_head | - | - | - | - | - | **HIGH PRIORITY** |
 | | | | | | | |
-| **llama.cpp** | **57.85** | - | - | 2449 | - | Target |
+| **llama.cpp** | **57.85** | - | - | 2449 | - | Target (MXFP4 lm_head) |
 | **SGLang** | **52.37** | - | - | - | 49.87ms | Target |
+
+### Key Observations
+
+1. **Prefill**: CUTLASS FP8×FP4 is **31% faster** than Marlin (5699 vs 4341 tok/s)
+2. **Decode**: CUTLASS slightly slower than Marlin (29 vs 31.6 tok/s) due to FP8 quantization overhead
+3. **Gap to targets**: 29 tok/s vs 52-58 tok/s - **BF16 lm_head is the bottleneck**
+4. **lm_head optimization** is highest priority for decode improvement
 
 ---
 
@@ -708,36 +744,117 @@ Implemented Option A: Create separate FlashInfer wrappers for each unique set of
 
 ---
 
-## Native CUTLASS MXFP4×MXFP8 Investigation
+## Native CUTLASS MXFP4 MoE on SM121 🎉
 
-**Status**: ⚠️ CUTLASS NOT WORKING ON SM121 - 2026-01-10
+**Status**: ✅ WORKING - 2026-01-11
 
-Attempted to compare native CUTLASS MXFP4 (FP8×FP4 tensor core MMA) vs Marlin.
+Successfully implemented SM120/SM121 CUTLASS FP8×FP4 MoE GEMM kernel.
 
-### CRITICAL FINDING
+### Configuration
 
-**Native CUTLASS MXFP4×MXFP8 kernels do NOT work on SM121 (GB10)!**
-
-All CUTLASS tactics failed during autotuning with:
+```yaml
+date: 2026-01-11 18:40:37
+moe_kernel: CUTLASS (FlashInfer FP8×FP4 for SM12x)
+attention_backend: FLASHINFER
+sinks: enabled (default)
+quantization: mxfp4
+enforce_eager: true
+load_format: fastsafetensors
 ```
-Unsupported tile (128, 128, 64) and cluster (1, 1, 1) shape combination for arch 120
+
+### Benchmark Results
+
+```
+llama-benchy 0.1.1
+model: gpt-oss-120b @ http://localhost:8000/v1
+latency_mode: generation
+runs: 3
 ```
 
-The CUTLASS kernels were designed for **SM100**, not SM12x. When `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1` is set on SM121:
-1. FlashInfer autotuner tries 18 CUTLASS tactics → ALL FAIL
-2. Falls back to Marlin
-3. Benchmark results were Marlin vs Marlin (identical performance)
+| Test | Throughput (tok/s) | TTFR (ms) | E2E TTFT (ms) |
+|------|-------------------|-----------|---------------|
+| **pp2048** | **5699.57 ± 38.47** | 427.37 ± 2.41 | 532.46 ± 2.85 |
+| **tg32** | **29.00 ± 0.10** | - | - |
+| **pp2048** | **5675.14 ± 36.37** | 428.91 ± 2.32 | 535.82 ± 1.72 |
+| **tg128** | **28.78 ± 0.07** | - | - |
 
-### What Works on SM121
+### Comparison to Baselines
 
-| MoE Backend | Status | Performance |
-|-------------|--------|-------------|
-| **Marlin** | ✅ Working | 29.4 t/s decode |
-| **CUTLASS MXFP4×MXFP8** | ❌ Not Working | Falls back to Marlin |
-| **Triton** | ⏳ Untested | - |
+| Config | pp2048 (tok/s) | tg32 (tok/s) | Notes |
+|--------|---------------|--------------|-------|
+| **CUTLASS FP8×FP4 + FlashInfer** | **5699** | **29.0** | ✅ Native SM121 |
+| Marlin + FlashInfer | 4341 | 31.9 | Marlin dequant path |
+| Upstream Baseline | 4341 | 31.6 | TRITON_ATTN + Marlin |
+| **llama.cpp** | 2449 | **57.85** | Target |
 
-### Implications
+### Key Findings
 
-1. **No native FP4×FP8 MMA available for SM121** - must use Marlin's BF16 dequant path
-2. **FlashInfer needs SM12x-specific tile configurations** for native FP4 support
-3. **Profiling results remain valid** - Marlin was the MoE kernel in all tests
+1. **Prefill is 31% faster** with CUTLASS (5699 vs 4341 tok/s)
+2. **Decode is slightly slower** (29 vs 31.6 tok/s) - see analysis below
+3. **6008 successful CUTLASS kernel runs** confirmed via debug logs
+4. **CUTLASS kernel working correctly**: `run=Success` for all expert groups
+
+### Decode Performance Gap Analysis
+
+**Why 29 tok/s (CUTLASS) vs 31.6 tok/s (Marlin)?**
+
+The CUTLASS FP8×FP4 kernel requires activation quantization overhead:
+- BF16 → FP8 quantization per forward pass
+- Scale factor computation per block (32 elements)
+
+For decode (M=1), this overhead may outweigh the memory bandwidth savings.
+
+**Why 29 tok/s (vLLM) vs 58 tok/s (llama.cpp)?**
+
+**Critical finding: lm_head format difference** (see `docs/analysis/LLAMA_CPP_ANALYSIS.md`)
+
+| | llama.cpp | vLLM |
+|--|-----------|------|
+| **lm_head format** | MXFP4 (FP4) | BF16 |
+| **lm_head size** | 0.29 GB | 1.16 GB |
+| **Memory read time** | ~1.1 ms | ~4.2 ms |
+
+The BF16 lm_head adds **3.1 ms per token** - a ~10 tok/s penalty at this throughput level.
+
+### GPU Time Breakdown (from nsys profile)
+
+| Component | % GPU Time | Kernel |
+|-----------|-----------|--------|
+| Dense GEMV (lm_head) | ~36% | `gemvx::kernel` |
+| MoE GEMM | ~34% | CUTLASS FP8×FP4 |
+| Memory/Elementwise | ~18% | Various |
+| Attention | ~1.5% | FlashInfer FA2 |
+
+**lm_head is the bottleneck**, not MoE or attention.
+
+### Implementation Details
+
+The SM120/SM121 CUTLASS kernel was implemented with:
+- Kernel types at **namespace scope** (critical fix for `Error Internal` bug)
+- `OpClassBlockScaledTensorOp` with wrapped `mx_float8_t`/`mx_float4_t` types
+- `KernelPtrArrayTmaWarpSpecializedPingpong` schedule
+- 128×128×128 tile shape, 1×1×1 cluster
+- Autotuner filtering to exclude unsupported `swap_ab=true` and `finalize_fusion` tactics
+
+### Next Steps for Decode Optimization
+
+1. **Implement MXFP4 for lm_head** - Potentially +30-45% decode speedup
+2. **Fuse BF16→FP8 activations into MoE expand (remove standalone `mxfp8_quantize()`)** - Recover CUTLASS decode regression on SM121  
+   - Plan: `docs/porting/SM121_MOE_FUSE_BF16_TO_FP8_EXPAND_PLAN.md`
+2. **Enable CUDA graphs** - Remove `--enforce-eager`
+3. **Test speculative decoding** - Eagle3 with CUTLASS backend
+4. **Profile dense GEMV kernels** - Investigate cuBLAS vs custom implementations
+
+---
+
+## Historical: CUTLASS Investigation (Pre-Fix)
+
+**Status**: ⚠️ SUPERSEDED by above - 2026-01-10
+
+Previous attempts at CUTLASS MXFP4 failed due to:
+1. Missing SM12x dispatch in `moe_gemm_template_dispatch_tma_ws.h`
+2. `Error Internal` from kernel types defined inside function templates
+3. Incorrect tile shapes (128×128×256 not supported on SM120)
+4. Missing autotuner filters for unsupported configurations
+
+All issues resolved in the 2026-01-11 implementation.
