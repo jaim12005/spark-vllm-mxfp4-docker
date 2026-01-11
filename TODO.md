@@ -35,3 +35,4 @@ For the initial testing, this might be okay - we can start with the basic mode a
 - add finalize fusion support
 - support swap?
 - configure the cutlass autotuner
+- Investigate mxfp8_quantize location in the pipeline
