@@ -134,11 +134,57 @@ vllm serve openai/gpt-oss-120b \
 
 | Variable | Purpose |
 |----------|---------|
-| `VLLM_MXFP4_MOE_KERNEL` | Override MoE kernel: `auto`, `marlin`, `gemm`, `gemv`, `triton` |
-| `VLLM_MXFP4_ACTIVATION` | Activation format: `bf16`, `mxfp8` |
+| `VLLM_MXFP4_BACKEND` | **Unified backend selector** (recommended) |
 | `VLLM_ATTENTION_BACKEND` | `FLASHINFER` or `FLASH_ATTN` |
-| `FLASHINFER_MOE_TILE` | Tile config: `auto`, `128x128`, `64x128` |
 | `FLASHINFER_LOGLEVEL` | 0-5 for debug logging |
+
+### MXFP4 Backend Options
+
+**CLI argument (recommended):**
+```bash
+vllm serve ... --quantization mxfp4 --mxfp4-backend CUTLASS
+```
+
+**Environment variable:**
+```bash
+export VLLM_MXFP4_BACKEND=CUTLASS
+```
+
+| Backend | Description | SM Support |
+|---------|-------------|------------|
+| `auto` | Hardware-based auto-selection | - |
+| `MARLIN` | Marlin dequant→BF16 | All GPUs |
+| `CUTLASS` | FlashInfer CUTLASS FP8×FP4 | SM100, SM12x |
+| `TRITON` | OpenAI Triton | SM90-SM100 |
+| `TRTLLM` | TRT-LLM BF16×FP4 | SM100 only |
+| `TRTLLM_MXFP8` | TRT-LLM FP8×FP4 | SM100 only |
+
+### SM12x Configuration (GB10)
+
+For SM12x native CUTLASS MXFP4 (once Phase 2 is complete):
+```bash
+vllm serve openai/gpt-oss-120b \
+    --quantization mxfp4 \
+    --mxfp4-backend CUTLASS
+```
+
+**Data Flow**:
+1. vLLM receives BF16 activations from model
+2. vLLM calls `mxfp8_quantize()` to convert BF16 → FP8
+3. FlashInfer CUTLASS kernel executes FP8×FP4 GEMM on SM12x tensor cores
+
+**Current Workaround** (until Phase 2 is complete):
+```bash
+export VLLM_MXFP4_BACKEND=MARLIN
+vllm serve openai/gpt-oss-120b --quantization mxfp4
+```
+
+### Deprecated Variables
+
+The following are deprecated and will show warnings:
+- `VLLM_MXFP4_MOE_KERNEL` → Use `VLLM_MXFP4_BACKEND`
+- `VLLM_MXFP4_ACTIVATION` → Use `VLLM_MXFP4_BACKEND`
+- `VLLM_USE_FLASHINFER_MOE_MXFP4_*` → Use `VLLM_MXFP4_BACKEND`
 
 See `docs/FEATURE_MATRIX.md` for full list.
 
@@ -188,12 +234,47 @@ from flashinfer import nvfp4_quantize
 ### Editing Kernels
 
 1. Edit on host: `vim ~/projects/flashinfer/include/flashinfer/moe/...`
-2. Clear JIT cache: `rm -rf ~/projects/ai/mxfp4/.cache/flashinfer/`
+2. Clear JIT cache (see below for selective clearing)
 3. Run test - FlashInfer JIT recompiles automatically
 
 ### Editing Python
 
 Changes are immediate - no cache clearing needed.
+
+### FlashInfer JIT Cache Structure
+
+The JIT cache is organized by architecture and operation type:
+
+```
+~/.cache/flashinfer/0.6.0/121a/cached_ops/
+├── fused_moe_120/           # SM120 MoE GEMM kernels (~10min to rebuild all)
+│   ├── moe_gemm_kernels_bf16_fp4.cuda.o   # MXFP4 (BF16 act)
+│   ├── moe_gemm_kernels_fp16_fp4.cuda.o   # MXFP4 (FP16 act)
+│   ├── moe_gemm_kernels_fp4_fp4.cuda.o    # NVFP4
+│   └── fused_moe_120.so                   # Final library
+├── fp4_quantization_121/    # FP4 quantization ops
+└── ...                      # Attention, other ops
+```
+
+### Selective Cache Clearing (Faster Testing)
+
+**Full clear** (slow - rebuilds everything ~10+ min):
+```bash
+rm -rf ~/.cache/flashinfer/0.6.0/121a/cached_ops/*
+```
+
+**MoE-only clear** (fast - rebuilds only MoE kernels ~2-5 min):
+```bash
+# Clear ONLY SM120 MoE GEMM kernels
+rm -rf ~/.cache/flashinfer/0.6.0/121a/cached_ops/fused_moe_120/
+```
+
+**Inside Docker**:
+```bash
+docker exec vllm-dev rm -rf /root/.cache/flashinfer/0.6.0/121a/cached_ops/fused_moe_120/
+```
+
+Use selective clearing when iterating on MoE launcher code to save significant build time.
 
 ### After Container Recreation
 
@@ -234,9 +315,16 @@ FLASHINFER_LOGLEVEL=3 vllm serve ... 2>&1 | grep -i "moe\|kernel\|cutlass"
 ### Clear All Caches
 
 ```bash
-rm -rf ~/projects/ai/mxfp4/.cache/flashinfer/
-rm -rf ~/projects/ai/mxfp4/.cache/vllm/
+# On host (outside Docker):
+rm -rf ~/projects/ai/mxfp4/.cache/flashinfer/*
+rm -rf ~/projects/ai/mxfp4/.cache/vllm/*
+
+# Inside Docker container:
+rm -rf ~/.cache/flashinfer/*
+rm -rf ~/.cache/vllm/*
 ```
+
+**Note:** The cache directories are Docker mounts. Delete the *contents* (`/*`), not the directories themselves, or Docker bind mounts will break.
 
 ### Run Baseline Benchmark
 

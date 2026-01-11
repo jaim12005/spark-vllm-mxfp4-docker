@@ -217,7 +217,7 @@ throughput:
 ### Expected Configuration
 ```yaml
 attention_backend: FLASHINFER  # Native FA2
-moe_kernel: SM100_FI_MXFP4_MXFP8_CUTLASS  # Native CUTLASS
+moe_kernel: CUTLASS_BLACKWELL_FP4FP8  # Native CUTLASS FP8×FP4
 ```
 
 ### Blocker

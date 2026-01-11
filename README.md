@@ -30,7 +30,7 @@ This Docker setup enables running GPT-OSS-120B with native MXFP4 quantization on
 ┌─────────────────────────────────────────────────────────────┐
 │                      FlashInfer                             │
 │   Fused MoE Backend Selection for SM121:                    │
-│   ├── CUTLASS Backend ✓ (SM90_FI_MXFP4_BF16)                │
+│   ├── CUTLASS Backend ✓ (CUTLASS_BLACKWELL_FP4FP8)          │
 │   ├── cuDNN Backend ✓ (MXFP4 supported, requires ≥9.14)     │
 │   └── TRTLLM Backend ✗ (SM100/SM103 only)                   │
 └─────────────────────────────────────────────────────────────┘

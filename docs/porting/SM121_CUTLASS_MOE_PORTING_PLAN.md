@@ -27,45 +27,101 @@ The `mxfp4_wip` branch contains a working implementation that:
 
 | File | Lines | Action | Status |
 |------|-------|--------|--------|
-| `sm12x_arch_config.h` | 72 | **NEW** | ✅ Done |
+| `sm12x_arch_config.h` | 97 | **NEW** | ✅ Done |
 | `moe_tma_warp_specialized_traits.h` | +61 | **MODIFY** | ✅ Done |
 | `moe_gemm_template_dispatch_tma_ws.h` | +59 | **MODIFY** | ✅ Done (incl. K fix) |
-| `moe_gemm_tma_ws_launcher.inl` | +45 | **MODIFY** | ✅ Done (incl. K fix) |
+| `moe_gemm_tma_ws_launcher.inl` | +45 | **MODIFY** | ✅ Done (incl. K fix + redefinition fix) |
 
-**Total Phase 1**: ~211 lines of changes (done)
+**Total Phase 1**: ~262 lines of changes (done)
 
 **Key Fixes (Polish)**:
 
 1. **K bytes→elements: Single Source of Truth** (`sm12x_arch_config.h`):
    ```cpp
-   Sm12xKBytesToElements<WeightType, KBytes>::value
+   Sm12xKBytesToElements<T, KBytes>::value  // T = activation type
    ```
    - Used by BOTH dispatch and launcher
-   - FP4 weights: 128 bytes → 256 elements
-   - Non-FP4: identity (K bytes = K elements)
+   - FP4 activations: 128 bytes → 256 elements
+   - FP8 activations: 128 bytes → 128 elements (identity)
+   - Parameterized on activation type T to match CUTLASS conventions
 
 2. **Removed false MXFP4 W4A16 claims**:
    - Kernel only supports NVFP4 (FP4×FP4) and FP8×FP4
    - BF16/FP16 activations are quantized to FP8 by vLLM layer first
    - Removed `IsMXFP4_W4A16`, `IsWFP4ABF16`, `IsWFP4AFP16` from kernel code
 
-### Phase 2: SM120 Mixed-Input Launcher (Required for MXFP4)
+3. **Fixed macro redefinition errors**:
+   - Constexpr variables `IsSM12x_`, `IsSM103_`, `TileK_` were at namespace scope
+   - When macro expanded multiple times → redefinition errors
+   - Fixed by inlining computation directly into template arguments
 
-| File | Lines | Action | Notes |
-|------|-------|--------|-------|
-| `moe_gemm_sm120_mixed_input_launcher.h` | 163 | **NEW** | Launcher header with SFA buffer APIs |
-| `moe_gemm_sm120_mixed_input_launcher.inl` | 600 | **NEW** | CUTLASS kernel launcher implementation |
-| `sm12x_layout_sfa_utils.h` | 281 | **NEW** | LayoutSFA buffer size computation |
+**Current Status**: Phase 1 passes redefinition check but fails with:
+```
+static assertion failed: "Specialization requires Stages set to value 2 or more."
+```
+This requires Phase 2 (SM120 block-scaled MMA needs ≥2 pipeline stages).
 
-**Total Phase 2**: ~1044 lines of new code
+**vLLM Configuration Changes (Phase 1.5)** ✅ COMPLETED:
+- Added unified `VLLM_MXFP4_BACKEND` env var
+- Deprecated legacy flags with warnings
+- Changed Blackwell default from BF16→MXFP8 CUTLASS (SM12x-compatible)
+- Data flow: BF16 → `mxfp8_quantize()` → FP8×FP4 CUTLASS kernel
 
-### Phase 3: Identity Scale Support (Required for W4A16)
+**Backend options (case-insensitive):**
+| Backend | Description | SM Support |
+|---------|-------------|------------|
+| `MARLIN` | Marlin dequant→BF16 | All GPUs |
+| `CUTLASS` | FlashInfer CUTLASS FP8×FP4 | SM100, SM12x |
+| `TRITON` | OpenAI Triton | SM90-SM100 |
+| `TRTLLM` | TRT-LLM BF16×FP4 | SM100 only |
+| `TRTLLM_MXFP8` | TRT-LLM FP8×FP4 | SM100 only |
 
-| File | Lines | Action | Notes |
-|------|-------|--------|-------|
-| `sm12x_activation_quantizer.cuh` | 1234 | **NEW** | Identity scale buffer manager, optional quant kernels |
+```bash
+# For SM12x (once Phase 2 is complete):
+vllm serve openai/gpt-oss-120b --quantization mxfp4 --mxfp4-backend CUTLASS
 
-**Total Phase 3**: ~1234 lines (much of this may be optional)
+# Current workaround:
+vllm serve openai/gpt-oss-120b --quantization mxfp4 --mxfp4-backend MARLIN
+```
+
+### Phase 2: Dedicated SM120 Launcher (Required) ✅ COMPLETED
+
+The SM120 block-scaled MMA (`sm120_blockscaled_mma_array_tma.hpp`) requires at least 2 pipeline stages:
+```cpp
+static_assert(Stages >= 2, "Specialization requires Stages set to value 2 or more.");
+```
+
+**Solution**: Instead of hacking the generic launcher, port the dedicated SM120 launcher from `mxfp4_wip`:
+
+| File | Lines | Action | Status |
+|------|-------|--------|--------|
+| `moe_gemm_sm120_mixed_input_launcher.h` | 163 | **NEW** | ✅ Done |
+| `moe_gemm_sm120_mixed_input_launcher.inl` | 600 | **NEW** | ✅ Done |
+| `sm12x_layout_sfa_utils.h` | 281 | **NEW** | ✅ Done |
+| `sm12x_activation_quantizer.cuh` | 1234 | **NEW** | ✅ Done |
+| `moe_gemm_tma_ws_launcher.inl` | -27 | **REVERT** | ✅ Cleaned up |
+| `moe_gemm_template_dispatch_tma_ws.h` | +15 | **MODIFY** | ✅ Done |
+
+**Key Changes**:
+
+1. **SM120-specific kernel schedule**: Uses `KernelPtrArrayTmaWarpSpecializedCooperativeBlockScaledSm120`
+   instead of the generic `KernelPtrArrayTmaWarpSpecializedCooperative`. This schedule is designed
+   for SM120/SM121 block-scaled tensor ops and ensures proper pipeline stage configuration.
+
+2. **Clean dispatch separation**: SM12x dispatch now routes directly to `sm120_mixed_input_moe_gemm_kernelLauncher`
+   instead of going through the generic TMA WS launcher.
+
+3. **Reverted generic launcher**: All SM12x-specific hacks (ternary K conversion, etc.) removed.
+   The generic launcher is now clean and only handles SM90/SM100/SM103.
+
+4. **Identity scale buffer management**: The `sm12x_activation_quantizer.cuh` provides cached identity
+   scale buffers for MXFP4 workloads (all 0x7F = scale factor 1.0).
+
+**Benefits**:
+- Cleaner code separation (SM12x logic in dedicated files)
+- Proper pipeline stage handling (no more "Stages < 2" errors)
+- Easier maintenance (changes don't affect other architectures)
+- Better error messages (SM12x-specific assertions and logging)
 
 ---
 
@@ -150,7 +206,7 @@ Key changes:
 ### Step 5: Test Minimal Port
 ```bash
 # Restart server with native CUTLASS
-export VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1
+export VLLM_MXFP4_BACKEND=CUTLASS
 vllm serve openai/gpt-oss-120b --quantization mxfp4 ...
 
 # Check autotuner no longer skips all tactics
