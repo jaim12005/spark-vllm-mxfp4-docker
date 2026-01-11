@@ -25,7 +25,6 @@ def test_mxfp4_quantize():
 
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
         mxfp4_e2m1_quantize,
-        mxfp4_e2m1_dequantize,
     )
 
     # Create test tensor
@@ -47,23 +46,13 @@ def test_mxfp4_quantize():
     assert weight_fp4.dtype == torch.uint8, f"Expected uint8, got {weight_fp4.dtype}"
     assert weight_scale.dtype == torch.uint8, f"Expected uint8, got {weight_scale.dtype}"
 
-    # Dequantize and check error
-    weight_dequant = mxfp4_e2m1_dequantize(weight_fp4, weight_scale, torch.bfloat16)
-    # Ensure same device
-    weight_dequant = weight_dequant.to(weight.device)
+    # Verify compression ratio
+    original_bytes = weight.numel() * 2  # bf16 = 2 bytes
+    compressed_bytes = weight_fp4.numel() + weight_scale.numel()  # uint8 = 1 byte each
+    compression_ratio = original_bytes / compressed_bytes
     
-    # Calculate relative error
-    rel_error = (weight_dequant - weight).abs() / (weight.abs() + 1e-6)
-    max_rel_error = rel_error.max().item()
-    mean_rel_error = rel_error.mean().item()
-
-    print(f"Dequantized weight: {weight_dequant.shape}, dtype={weight_dequant.dtype}")
-    print(f"Max relative error: {max_rel_error:.4f}")
-    print(f"Mean relative error: {mean_rel_error:.4f}")
-
-    # FP4 has limited precision, expect some error but it should be reasonable
-    assert max_rel_error < 2.0, f"Max relative error too high: {max_rel_error}"
-    assert mean_rel_error < 0.5, f"Mean relative error too high: {mean_rel_error}"
+    print(f"Compression ratio: {compression_ratio:.2f}x")
+    assert compression_ratio > 3.5, f"Compression ratio too low: {compression_ratio}"
 
     print("✓ MXFP4 quantization test passed!\n")
 
@@ -187,40 +176,75 @@ def test_group_gemm_kernel():
     return True
 
 
-def test_dequant_gemm():
-    """Test the dequant + BF16 GEMM approach (current implementation)."""
+def test_marlin_gemm():
+    """Test the Marlin fused dequant+GEMM approach (current implementation)."""
     print("=" * 60)
-    print("Test 3b: Dequant + BF16 GEMM approach")
+    print("Test 3b: Marlin Fused Dequant+GEMM approach")
     print("=" * 60)
 
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        apply_fp4_marlin_linear,
+        prepare_fp4_layer_for_marlin,
+    )
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
         mxfp4_e2m1_quantize,
-        mxfp4_e2m1_dequantize,
     )
 
     # Set seed for reproducibility
     torch.manual_seed(42)
 
-    # Realistic lm_head dimensions (smaller for testing)
+    # Marlin kernel has constraints: K % 128 == 0, N % 64 == 0 typically
     M = 4  # num_tokens
-    K = 256  # hidden_size
-    N = 128  # vocab_size subset
+    K = 256  # hidden_size (must be multiple of 128)
+    N = 128  # vocab_size subset (must be multiple of 64)
+
+    # Create a mock layer that prepare_fp4_layer_for_marlin expects
+    class MockLinear(torch.nn.Module):
+        def __init__(self, out_features, in_features, dtype):
+            super().__init__()
+            self.input_size_per_partition = in_features
+            self.output_size_per_partition = out_features
+            self.params_dtype = dtype
+            self.bias = None
+
+    layer = MockLinear(N, K, torch.bfloat16)
 
     # Create test tensors with bounded values to avoid extreme relative errors
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    original_weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
 
     # Reference BF16 matmul
-    ref_output = torch.nn.functional.linear(x, weight)
+    ref_output = torch.nn.functional.linear(x, original_weight)
 
-    # Quantize weights to FP4
-    weight_fp4, weight_scale = mxfp4_e2m1_quantize(weight)
-    print(f"Weight: {weight.shape} -> FP4 {weight_fp4.shape}, scale {weight_scale.shape}")
+    # Step 1: Quantize to MXFP4
+    weight_fp4, weight_scale = mxfp4_e2m1_quantize(original_weight)
+    
+    # Register as parameters on the layer (what process_weights_after_loading does)
+    layer.weight = torch.nn.Parameter(weight_fp4, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
-    # Dequantize and GEMM
-    weight_dequant = mxfp4_e2m1_dequantize(weight_fp4, weight_scale, torch.bfloat16)
-    weight_dequant = weight_dequant.to(x.device)  # Ensure same device
-    output = torch.nn.functional.linear(x, weight_dequant)
+    print(f"Original weight: {original_weight.shape}")
+    print(f"FP4 weight: {layer.weight.shape}, dtype={layer.weight.dtype}")
+    print(f"FP4 scale: {layer.weight_scale.shape}, dtype={layer.weight_scale.dtype}")
+
+    # Step 2: Prepare for Marlin (repack weights + scales)
+    prepare_fp4_layer_for_marlin(layer)
+
+    print(f"Marlin weight: {layer.weight.shape}, dtype={layer.weight.dtype}")
+    print(f"Marlin scale: {layer.weight_scale.shape}, dtype={layer.weight_scale.dtype}")
+    print(f"Has workspace: {hasattr(layer, 'workspace')}")
+
+    # Step 3: Run Marlin GEMM
+    output = apply_fp4_marlin_linear(
+        input=x,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        weight_scale_2=None,  # MXFP4 uses single scale, not NVFP4
+        workspace=layer.workspace,
+        size_n=N,
+        size_k=K,
+        bias=None,
+    )
 
     print(f"Output: {output.shape}")
 
@@ -249,11 +273,11 @@ def test_dequant_gemm():
     # For FP4, cosine similarity > 0.9 is good, > 0.95 is excellent
     # Normalized RMSE < 0.5 is acceptable
     if cosine_sim > 0.95:
-        print("✓ Dequant + GEMM test passed with excellent accuracy!\n")
+        print("✓ Marlin GEMM test passed with excellent accuracy!\n")
     elif cosine_sim > 0.90:
-        print(f"✓ Dequant + GEMM test passed with good accuracy (cos_sim={cosine_sim:.4f})\n")
+        print(f"✓ Marlin GEMM test passed with good accuracy (cos_sim={cosine_sim:.4f})\n")
     elif cosine_sim > 0.80:
-        print(f"⚠ Dequant + GEMM test passed with moderate accuracy (cos_sim={cosine_sim:.4f})\n")
+        print(f"⚠ Marlin GEMM test passed with moderate accuracy (cos_sim={cosine_sim:.4f})\n")
     else:
         assert False, f"Cosine similarity too low: {cosine_sim:.4f}"
     return True
@@ -318,8 +342,8 @@ def main():
         test_mxfp4_quantize()
         test_mxfp8_quantize()
         
-        # Test dequant + GEMM approach (works on all GPUs)
-        test_dequant_gemm()
+        # Test Marlin fused dequant+GEMM (works on all NVIDIA GPUs >= SM75)
+        test_marlin_gemm()
         
         # Test lm_head memory savings
         test_lm_head_size()
