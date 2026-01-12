@@ -14,6 +14,17 @@ Status and configuration for each feature in the optimization work.
 | Tile Variants (64x128) | ⏳ Pending | P4 | `FLASHINFER_MOE_TILE=64x128` | `auto` |
 | Speculative Decoding | ⏳ Pending | P5 | vLLM flags | off |
 | Attention Sinks | ⏳ Pending | P6 | `VLLM_USE_ATTENTION_SINKS=1` | `0` |
+| **lm_head MXFP4** | ✅ Complete | - | auto (Blackwell only) | off |
+
+**Note on lm_head MXFP4**: Currently uses Marlin kernel (weight-only FP4 compression → dequant to BF16 → BF16 GEMM). This is a pragmatic intermediate that reduces memory bandwidth but does NOT use native FP8×FP4 MMA. Since lm_head is only ~6% of decode time, this is not the bottleneck. The path to 52+ tok/s requires optimizing MoE (34% of decode) and attention (1.5% but could be higher with different configs), not lm_head.
+
+**lm_head MXFP4 Compatibility Gates** (automatically disabled when):
+- **LoRA enabled**: FP4-packed weights incompatible with LoRA's additive updates
+  - Note: This is a broad gate - ANY LoRA config disables lm_head MXFP4, even if LoRA doesn't target lm_head specifically
+- **Tied embeddings**: Would corrupt shared embedding table
+  - Config check: `hf_config.tie_word_embeddings`
+  - Structural check: `data_ptr()` comparison detects actual storage aliasing
+- Falls back to BF16 lm_head when either condition is detected
 
 **Legend**: ✅ Complete | 🔄 In Progress | ⏳ Pending | ❌ Blocked | 🚫 Not Pursuing
 
@@ -155,6 +166,14 @@ Attention Sinks (P6)
 - **Issue**: TMA layout constraint with 128-element scale granularity
 - **Workaround**: Use M=128 tiles only
 - **Status**: Requires FlashInfer architectural change
+
+### Tied Embeddings + MXFP4 lm_head
+
+- **Issue**: When `tie_word_embeddings=True`, `lm_head.weight` aliases `embed_tokens.weight`. Quantizing lm_head would also quantize the embedding table, breaking `F.embedding()` (FP4-packed weights are incompatible with embedding lookup).
+- **Behavior**: MXFP4 quantization is automatically skipped for `lm_head` when `tie_word_embeddings=True`.
+- **Detection**: Checked in `Mxfp4Config.get_quant_method()` via `hf_config.tie_word_embeddings`.
+- **Log Message**: `"[MXFP4] Skipping MXFP4 quantization for lm_head... tie_word_embeddings=True"`
+- **Status**: By design (not a bug)
 
 ---
 
