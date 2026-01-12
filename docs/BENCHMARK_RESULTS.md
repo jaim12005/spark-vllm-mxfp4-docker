@@ -8,7 +8,8 @@ Live tracking of benchmark results across configurations.
 
 | Metric | Baseline | Best | Config | Date |
 |--------|----------|------|--------|------|
-| tg32 (tok/s) | 31.63 | 31.63 | Upstream (Marlin) | 2026-01-09 |
+| tg32 (tok/s) | 31.63 | **34.4** | **CUTLASS + MXFP4 lm_head** | 2026-01-12 |
+| tg64 (tok/s) | 31.62 | **34.1** | **CUTLASS + MXFP4 lm_head** | 2026-01-12 |
 | tg128 (tok/s) | 31.62 | 31.62 | Upstream (Marlin) | 2026-01-09 |
 | tg256 (tok/s) | 31.12 | 31.12 | Upstream (Marlin) | 2026-01-09 |
 | pp512 (tok/s) | 2209 | 2209 | Upstream Baseline | 2026-01-09 |
@@ -17,9 +18,11 @@ Live tracking of benchmark results across configurations.
 | pp4096 (tok/s) | 4008 | 4008 | Upstream Baseline | 2026-01-09 |
 | TTFT@pp2048 (ms) | ~555 | **~532** | **CUTLASS FP8×FP4** | 2026-01-11 |
 
-**Milestone achieved**: Native SM121 CUTLASS FP8×FP4 MoE GEMM working! Prefill 31% faster.
+**Milestones achieved**:
+1. ✅ Native SM121 CUTLASS FP8×FP4 MoE GEMM - Prefill 31% faster
+2. ✅ MXFP4 lm_head with Marlin kernel - Decode +9% (29 → 34 tok/s)
 
-**Remaining gap**: Decode at 29 tok/s vs target 52-58 tok/s. Root cause identified: BF16 lm_head.
+**Remaining gap**: Decode at 34 tok/s vs target 52-58 tok/s (37% below target).
 
 ---
 
@@ -844,6 +847,97 @@ The SM120/SM121 CUTLASS kernel was implemented with:
 2. **Enable CUDA graphs** - Remove `--enforce-eager`
 3. **Test speculative decoding** - Eagle3 with CUTLASS backend
 4. **Profile dense GEMV kernels** - Investigate cuBLAS vs custom implementations
+
+---
+
+## MXFP4 lm_head + CUTLASS MoE (2026-01-12)
+
+**Status**: ✅ COMPLETE - lm_head MXFP4 implemented with Marlin kernel
+
+### Configuration
+
+```yaml
+date: 2026-01-12
+moe_kernel: CUTLASS (FlashInfer FP8×FP4 for SM12x)
+lm_head: MXFP4 (Marlin fused dequant+GEMM)
+attention_backend: FLASHINFER
+sinks: enabled (default)
+quantization: mxfp4
+enforce_eager: true
+load_format: safetensors
+```
+
+### Benchmark Results
+
+```
+llama-benchy 0.1.1
+model: gpt-oss-120b @ http://localhost:8000/v1
+latency_mode: api
+runs: 10
+```
+
+| Test | Throughput (tok/s) | TTFR (ms) | Notes |
+|------|-------------------|-----------|-------|
+| **pp2048** | **4380.72 ± 315.12** | 405.33 ± 35.47 | Prefill |
+| **tg32** | **34.44 ± 0.18** | - | Decode |
+
+### Manual Profiling Results
+
+| Output Length | Tokens | Time (ms) | Throughput (tok/s) |
+|---------------|--------|-----------|-------------------|
+| tg16 | 16 | 543.2 | 29.45 |
+| tg32 | 32 | 961.9 | 33.27 |
+| tg64 | 64 | 1879.6 | 34.05 |
+
+### Comparison to Previous Results
+
+| Config | tg32 (tok/s) | Change |
+|--------|--------------|--------|
+| Upstream Baseline (BF16 lm_head) | 31.6 | - |
+| CUTLASS MoE (BF16 lm_head) | 29.0 | -8% |
+| **CUTLASS MoE + MXFP4 lm_head** | **34.4** | **+9%** |
+| **Target (llama.cpp)** | **52-58** | - |
+
+### lm_head MXFP4 Quantization Log
+
+```
+[MXFP4] lm_head quantized: torch.Size([201088, 2880]) BF16 -> torch.Size([201088, 1440]) FP4 (4x smaller)
+```
+
+Memory savings: ~1.1 GB → ~0.28 GB (4x reduction)
+
+### Gap Analysis
+
+| Metric | Current | Target | Gap |
+|--------|---------|--------|-----|
+| tg32 (tok/s) | 34.4 | 52 | **37% below** |
+| tg32 (tok/s) | 34.4 | 58 | **41% below** |
+
+### Components Active
+
+- ✅ MoE: CUTLASS SM120 FP8×FP4 MXFP4 kernel
+- ✅ lm_head: Marlin FP4 dequant+GEMM (4x smaller weights)
+- ✅ Attention: FlashInfer CUTLASS (SM12x) with sinks
+
+### Remaining Bottlenecks (Estimated)
+
+| Component | Est. % of Decode Time | Optimization Opportunity |
+|-----------|----------------------|--------------------------|
+| MoE GEMM | ~34% | Already using CUTLASS FP8×FP4 |
+| Dense GEMV | ~30-35% | Attention projections still BF16 |
+| lm_head | ~6% | ✅ Now using Marlin MXFP4 |
+| Attention | ~1.5% | Already optimized |
+| Other | ~25% | Memory/elementwise ops |
+
+### Notes on Marlin vs Native FP8×FP4
+
+The lm_head uses Marlin (weight-only FP4 → dequant to BF16 → BF16 GEMM) rather than native FP8×FP4 MMA because:
+
+1. Marlin is a proven, stable kernel for small-M GEMV
+2. Native FP8×FP4 grouped GEMM has small-M inefficiency
+3. lm_head is only ~6% of decode time - not the priority bottleneck
+
+A native FP8×FP4 small-M kernel for lm_head could provide additional gains but is not the critical path to 52+ tok/s.
 
 ---
 
