@@ -2,7 +2,6 @@
 
 **Status**: Proposed  
 **Date**: 2026-01-12  
-**Author**: AI Assistant  
 
 ## Overview
 
@@ -26,30 +25,53 @@ The existing `Mxfp4LinearMethod` (mxfp4.py:448-555) is already implemented but *
 
 **Change**: Make `Mxfp4Config.get_quant_method()` return `Mxfp4LinearMethod()` for QKV/O projections when enabled.
 
-### 2. Feature Gating with Environment Variables
+### 2. Feature Gating with `--mxfp4-layers` CLI Argument
 
-Add layer-specific quantization controls:
+Add a new CLI argument following the `--mxfp4-backend` pattern:
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `VLLM_MXFP4_QUANTIZE_QKV` | `0` | Enable MXFP4 for qkv_proj layers |
-| `VLLM_MXFP4_QUANTIZE_O` | `0` | Enable MXFP4 for o_proj layers |
-| `VLLM_MXFP4_QUANTIZE_LM_HEAD` | `auto` | Existing (auto-enables on Blackwell) |
+```bash
+# Default: only MoE experts (current behavior)
+vllm serve ... --quantization mxfp4
 
-**Rationale**: Off by default for safety; opt-in enables A/B testing.
+# Add QKV/O projections
+vllm serve ... --quantization mxfp4 --mxfp4-layers moe,qkv,o,lm_head
+
+# Shorthand for all supported layers
+vllm serve ... --quantization mxfp4 --mxfp4-layers all
+```
+
+**Supported layer tokens:**
+
+| Token | Layers Matched | Description |
+|-------|----------------|-------------|
+| `moe` | `*.experts.*` | MoE expert weights (default, always included) |
+| `qkv` | `*.qkv_proj` | Fused QKV projection |
+| `o` | `*.o_proj` | Attention output projection |
+| `lm_head` | `lm_head` | Output logits projection |
+| `all` | All above | Shorthand for full quantization |
+
+**Default behavior**: `--mxfp4-layers moe` (backwards compatible)
+
+**Rationale**: 
+- Follows existing `--mxfp4-backend` pattern
+- Explicit inclusion list is clearer than exclusion
+- Easy to A/B test different layer combinations
 
 ### 3. Layer Matching Logic
 
-In `Mxfp4Config.get_quant_method()`, add prefix matching:
+In `Mxfp4Config.get_quant_method()`, check the configured layers:
 
 ```python
 elif isinstance(layer, LinearBase):
+    # Get configured layers from vllm_config
+    mxfp4_layers = vllm_config.model_config.mxfp4_layers  # e.g., {"qkv", "o", "lm_head"}
+    
     is_qkv = prefix.endswith(".qkv_proj")
     is_o = prefix.endswith(".o_proj")
     
-    if is_qkv and os.getenv("VLLM_MXFP4_QUANTIZE_QKV", "0") == "1":
+    if is_qkv and "qkv" in mxfp4_layers:
         return Mxfp4LinearMethod()
-    if is_o and os.getenv("VLLM_MXFP4_QUANTIZE_O", "0") == "1":
+    if is_o and "o" in mxfp4_layers:
         return Mxfp4LinearMethod()
     
     # Default: unquantized
@@ -82,17 +104,20 @@ This is the same Marlin path as lm_head - no kernel work needed.
 
 | File | Change |
 |------|--------|
-| `vllm/model_executor/layers/quantization/mxfp4.py` | Update `get_quant_method()` to return `Mxfp4LinearMethod` for QKV/O based on env vars |
-| `vllm/envs.py` | Add `VLLM_MXFP4_QUANTIZE_QKV` and `VLLM_MXFP4_QUANTIZE_O` |
-| `docs/FEATURE_MATRIX.md` | Document new env vars |
+| `vllm/config/model.py` | Add `mxfp4_layers: str = "moe"` field to ModelConfig |
+| `vllm/engine/arg_utils.py` | Add `--mxfp4-layers` CLI argument |
+| `vllm/model_executor/layers/quantization/mxfp4.py` | Update `get_quant_method()` to check `mxfp4_layers` config |
+| `docs/FEATURE_MATRIX.md` | Document new `--mxfp4-layers` option |
 
 ## Testing Plan
 
 ### Level 1: Smoke Test
 
 ```bash
-VLLM_MXFP4_QUANTIZE_QKV=1 VLLM_MXFP4_QUANTIZE_O=1 \
-  vllm serve openai/gpt-oss-120b --quantization mxfp4 ...
+vllm serve openai/gpt-oss-120b \
+  --quantization mxfp4 \
+  --mxfp4-layers moe,qkv,o,lm_head \
+  --enforce-eager
 ```
 
 - Verify server starts and generates coherent text
@@ -142,11 +167,12 @@ nsys profile ... 2>&1 | grep -i "marlin\|gemvx"
 
 ## Implementation Todos
 
-- [ ] Add `VLLM_MXFP4_QUANTIZE_QKV` and `VLLM_MXFP4_QUANTIZE_O` to `vllm/envs.py`
-- [ ] Update `Mxfp4Config.get_quant_method()` to return `Mxfp4LinearMethod` for QKV/O
+- [ ] Add `mxfp4_layers: str = "moe"` to `vllm/config/model.py` ModelConfig
+- [ ] Add `--mxfp4-layers` argument to `vllm/engine/arg_utils.py`
+- [ ] Update `Mxfp4Config.get_quant_method()` to check `mxfp4_layers` and return `Mxfp4LinearMethod` for QKV/O
 - [ ] Add LoRA compatibility check for linear layers (fallback to BF16)
-- [ ] Update `docs/FEATURE_MATRIX.md` with new env vars
-- [ ] Run smoke test: server startup and basic generation with flags ON
+- [ ] Update `docs/FEATURE_MATRIX.md` with new `--mxfp4-layers` option
+- [ ] Run smoke test: `--mxfp4-layers moe,qkv,o,lm_head`
 - [ ] nsys profile to verify Marlin kernels are used for QKV/O
-- [ ] Run tg32 benchmark comparing QKV/O MXFP4 ON vs OFF
+- [ ] Run tg32 benchmark comparing `--mxfp4-layers moe` vs `--mxfp4-layers all`
 - [ ] Profile embed_tokens contribution to Dense GEMV bucket (future decision)
