@@ -252,74 +252,88 @@ The GEMM sees the **per-expert row counts**, not total tokens or expanded rows.
 
 ### Tile Selection Function
 
+**⚠️ CRITICAL: Avoid GPU→CPU sync in hot path**
+
+The naive approach (`rows_per_expert.max().item()`) forces a GPU sync every token,
+which is catastrophic for decode latency. Use host-side heuristics instead.
+
 ```python
 def select_tile_m_for_moe(
-    total_tokens_including_expert: torch.Tensor,  # Shape: [num_experts + 1]
-    num_experts: int,
+    num_tokens: int,      # Host-side value (input.shape[0])
+    top_k: int,           # Host-side constant (e.g., 8)
+    num_experts: int,     # Host-side constant (e.g., 128)
+    is_decode: bool,      # True if num_tokens is small
 ) -> int:
-    """Select optimal TILE_M based on max tokens per expert (group size).
+    """Select optimal TILE_M using HOST-SIDE heuristics only.
     
-    IMPORTANT: This function is called AFTER routing, when we know the actual
-    distribution of tokens across experts. The `total_tokens_including_expert`
-    tensor is the cumsum of tokens per expert (already computed during routing).
+    NO GPU TENSORS, NO .item() CALLS - these sync and kill decode perf.
     
-    In MoE grouped GEMM:
-    - total_tokens_including_expert[i+1] - total_tokens_including_expert[i] = rows for expert i
-    - The GEMM for each expert has M = rows_for_that_expert  
-    - We pick TILE_M based on the MAXIMUM group size (worst case)
+    Heuristic: estimate max_rows_per_expert from host-known quantities.
     
-    Example (decode with 1 token, top_k=8, 128 experts):
-    - expanded_num_rows = 1 × 8 = 8 (but distributed across experts)
-    - 8 experts get 1 row each (M=1)
-    - 120 experts get 0 rows (M=0, skipped)
-    - max_rows_per_expert = 1 → TILE_M = 8
+    For uniform distribution:
+        avg_rows_per_expert = (num_tokens × top_k) / num_experts
+        
+    For skewed distribution (worst case):
+        max_rows_per_expert ≈ 2-3× average (empirical)
     
-    Example (prefill with 2048 tokens, top_k=8, 128 experts):
-    - expanded_num_rows = 2048 × 8 = 16384 rows
-    - Distributed across 128 experts: avg ~128, max ~200-300
-    - max_rows_per_expert = 250 → TILE_M = 128
+    For decode (small num_tokens):
+        max_rows_per_expert ≤ top_k (at most top_k experts get 1 row each)
     """
-    # Compute rows per expert from cumulative offsets
-    # This is already available from the routing step
-    rows_per_expert = (
-        total_tokens_including_expert[1:] - total_tokens_including_expert[:-1]
-    )
     
-    # Use max as the tile selection signal
-    # (could also use p90 for less sensitivity to outliers)
-    max_rows_per_expert = rows_per_expert.max().item()
+    # Fast path for decode: max is bounded by top_k
+    if is_decode or num_tokens <= 8:
+        # With 1-8 tokens and top_k=8, max per expert is at most ~top_k
+        return 16  # Conservative; could use 8 if validated
+    
+    # Heuristic for batched/prefill: estimate from average with skew factor
+    expanded_rows = num_tokens * top_k
+    avg_per_expert = expanded_rows / num_experts
+    estimated_max = avg_per_expert * 2.5  # Skew factor (empirical)
     
     # Threshold to tile size
-    # NOTE: Start conservative. Smaller tiles (8, 16) may have alignment/
-    # vectorization issues on SM120. Validate each before enabling.
-    #
-    # Priority order for implementation:
-    #   1. 128 - known working (current)
-    #   2. 64, 32 - likely safe, try first
-    #   3. 16 - may require alignment checks  
-    #   4. 8 - experimental, may not work with TMA/vectorized epilogues
-    #
-    VALID_TILE_M = [16, 32, 64, 128]  # Start conservative, add 8 if it works
+    VALID_TILE_M = [16, 32, 64, 128]
     for tile_m in VALID_TILE_M:
-        if max_rows_per_expert <= tile_m:
+        if estimated_max <= tile_m:
             return tile_m
     
-    return 128  # Fallback for large groups
+    return 128  # Prefill uses large tiles anyway
 ```
 
-**Key insight:** We use `total_tokens_including_expert` (already computed during routing),
-NOT `input.shape[0]` (raw input tokens) or `input.shape[0] * top_k` (expanded rows).
+**Why host-side heuristics are safe:**
+- Picking a tile SMALLER than actual max is still correct (just uses >1 CTA along M)
+- Picking a tile LARGER than actual max wastes some compute (current behavior)
+- The heuristic errs toward slightly larger tiles, which is safer
 
-**Alternative: Use p90 instead of max**
+**Alternative: Use host-side values from GEMM setup**
+
+Many grouped GEMM launchers already materialize per-group sizes on host when
+building the grouped GEMM input struct. If FlashInfer does this, compute max there:
+
+```cpp
+// In moe_gemm_tma_warp_specialized_input.cu or similar
+// When building problem_shapes array, track max M
+int64_t max_m = 0;
+for (int i = 0; i < num_experts; i++) {
+    int64_t rows_for_expert = total_tokens_including_expert[i+1] 
+                            - total_tokens_including_expert[i];
+    problem_shapes[i] = make_shape(rows_for_expert, N, K);
+    max_m = std::max(max_m, rows_for_expert);
+}
+// max_m is now available on host without GPU sync
+```
+
+**What NOT to do:**
 ```python
-# Less sensitive to outlier experts with unusual token counts
-p90_rows = torch.quantile(rows_per_expert.float(), 0.9).item()
-```
+# ❌ BAD: Forces GPU→CPU sync every call
+max_rows = rows_per_expert.max().item()
 
-**Why max (or p90) matters:**
-- The grouped GEMM launches one kernel for ALL experts
-- The tile shape must accommodate the LARGEST group
-- Small groups get padded to the tile size anyway
+# ❌ BAD: Also syncs
+p90_rows = torch.quantile(rows_per_expert.float(), 0.9).item()
+
+# ❌ BAD: Even worse - multiple syncs
+for i in range(num_experts):
+    rows = (offsets[i+1] - offsets[i]).item()  # SYNC per expert!
+```
 
 
 @functools.cache
@@ -355,18 +369,23 @@ def cutlass_fused_moe(
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
     fc2_expert_weights: torch.Tensor,
-    total_tokens_including_expert: torch.Tensor,  # Routing cumsum
     num_experts: int,
+    top_k: int,
     output_dtype: torch.dtype = torch.bfloat16,
     auto_tile_select: bool = True,
     activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
     
-    # Select optimal TILE_M based on max tokens PER EXPERT (not total tokens)
+    num_tokens = input.shape[0]  # Host-side value, no sync
+    
+    # Select optimal TILE_M using HOST-SIDE heuristics only
+    # NO GPU tensor access here - that would sync and kill perf
     if auto_tile_select:
         tile_m = select_tile_m_for_moe(
-            total_tokens_including_expert,
-            num_experts,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_experts=num_experts,
+            is_decode=(num_tokens <= 8),
         )
     else:
         tile_m = 128  # Default (prefill-optimized)
@@ -382,8 +401,10 @@ def cutlass_fused_moe(
     return module.run(input, ...)
 ```
 
-**Note:** `total_tokens_including_expert` is already computed during MoE routing
-(it's the cumsum of tokens per expert, used to index into the permuted activation buffer).
+**Key difference from naive approach:**
+- Uses `num_tokens`, `top_k`, `num_experts` (all host-side)
+- Does NOT access `total_tokens_including_expert` tensor
+- No `.item()` calls, no GPU sync
 
 ### 6.4 Update C++ Template to Accept Tile Parameters
 
@@ -661,6 +682,7 @@ Expected gain = (utilization improvement) × (MoE GEMM fraction) × (efficiency 
 
 | Risk | Mitigation |
 |------|------------|
+| **GPU sync in tile selection** | Use host-side heuristics ONLY (Section 6.2) |
 | Compiler "Error Internal" | Follow existing namespace pattern exactly |
 | First-call JIT latency | Pre-warm during server startup |
 | Cache key collision | Include full tile shape in module name |
