@@ -264,13 +264,15 @@ def select_tile_m_for_moe(num_tokens: int) -> int:
     NO GPU TENSORS, NO .item() CALLS - these sync and kill decode perf.
     
     Just two cases:
-    - Decode/small batch: TILE_M=16
+    - Decode/small batch: TILE_M=64 (safest small tile)
     - Prefill/large batch: TILE_M=128
+    
+    Start with 64 (likely compiles cleanly), then try 32/16 if gains justify.
     """
     DECODE_THRESHOLD = 64  # Tune based on workload mix
     
     if num_tokens <= DECODE_THRESHOLD:
-        return 16   # Decode-optimized
+        return 64   # Decode-optimized (start safe, reduce later if validated)
     else:
         return 128  # Prefill-optimized
 ```
@@ -410,25 +412,23 @@ After running with the minimal tile set, cache will contain:
 
 ```
 ~/.cache/flashinfer/0.6.0/121a/cached_ops/
-├── fused_moe_120_M16_N128_K128/     # decode / small batch
-│   └── fused_moe_120_M16_N128_K128.so
+├── fused_moe_120_M64_N128_K128/     # decode / small batch (safest small tile)
+│   └── fused_moe_120_M64_N128_K128.so
 └── fused_moe_120_M128_N128_K128/    # prefill / large batch
     └── fused_moe_120_M128_N128_K128.so
 ```
 
 **Typical workload → tile mapping (gpt-oss-120b: 128 experts, top_k=8):**
 
-| Workload | Input Tokens | Estimated Max/Expert | TILE_M |
-|----------|--------------|---------------------|--------|
-| Decode (1-8 req) | 1-8 | 1-2 | **16** |
-| Small batch | 32 | ~4 | **16** |
-| Medium batch | 128 | ~12 | **16** |
-| Large batch | 512 | ~40 | **128** |
-| Prefill | 2048 | ~200 | **128** |
+| Workload | Input Tokens | TILE_M |
+|----------|--------------|--------|
+| Decode (1-64 tokens) | 1-64 | **64** |
+| Large batch / Prefill | 65+ | **128** |
 
-**Start with 2 tiles.** Add 32/64 only if measurements show:
-1. Significant time in 32-64 range workloads
-2. Measurable latency improvement with finer tiles
+**Start with 64+128.** After validating:
+1. Try 32 if 64 shows gains
+2. Try 16 if 32 works
+3. Try 8 only if 16 is clean
 
 ### 7.2 First-Call vs Cached Performance
 
@@ -491,13 +491,13 @@ def prewarm_moe_tiles():
     """Pre-compile tile variants during server startup.
     
     Start with just 2 tiles to minimize startup time:
-    - 16: decode and small batches
+    - 64: decode and small batches (safest small tile)
     - 128: prefill and large batches
     
     At ~20s per tile, this is ~40s startup cost.
-    Add more tiles (32, 64) only after measuring real gains.
+    Add smaller tiles (32, 16) only after validation.
     """
-    TILES_TO_PREWARM = [16, 128]  # Minimal set
+    TILES_TO_PREWARM = [64, 128]  # Minimal safe set
     for tile_m in TILES_TO_PREWARM:
         _ = get_cutlass_fused_moe_module(backend="120", tile_m=tile_m)
     print(f"Prewarmed {len(TILES_TO_PREWARM)} MoE tile variants")
@@ -506,9 +506,9 @@ def prewarm_moe_tiles():
 **Startup cost:**
 | Tiles | Compile Time | Use Case |
 |-------|--------------|----------|
-| 2 (16, 128) | ~40s | **Recommended starting point** |
-| 3 (16, 64, 128) | ~60s | Add 64 if medium batches are common |
-| 5 (8-128) | ~100s | Only if all sizes show measured gains |
+| 2 (64, 128) | ~40s | **Recommended starting point** |
+| 3 (32, 64, 128) | ~60s | After 64 shows gains |
+| 4 (16, 32, 64, 128) | ~80s | After 32 is validated |
 
 ---
 
@@ -597,11 +597,25 @@ Expected gain = (utilization improvement) × (MoE GEMM fraction) × (efficiency 
 3. Check vectorized epilogue constraints
 4. Compile a test kernel with each proposed tile size
 
-**Recommended validation order (minimal approach):**
-- ✅ 128×128×128 - known working (prefill)
-- 🔬 16×128×128 - validate first (decode) - may need alignment adjustments
-- ⏸️ 32, 64 - defer until 16+128 are working and measured
-- ⏸️ 8 - defer; may not work with TMA/vectorized epilogues
+**Recommended validation order:**
+
+Small TILE_M can break TMA transaction shapes, epilogue vectorization, and 
+warp-specialized scheduling. Validate from safest to riskiest:
+
+| Order | TILE_M | Risk | Notes |
+|-------|--------|------|-------|
+| 1 | 128 | ✅ None | Known working (current) |
+| 2 | 64 | 🟢 Low | Likely compiles cleanly |
+| 3 | 32 | 🟢 Low | Likely compiles cleanly |
+| 4 | 16 | 🟡 Medium | May need alignment adjustments |
+| 5 | 8 | 🔴 High | Try only if 16 works; TMA/vectorization issues likely |
+
+**Implementation strategy:**
+1. Implement 64 first (safest small tile)
+2. Benchmark 64 vs 128 on real decode workload
+3. If 64 shows gains, try 32
+4. If 32 works, try 16
+5. Only try 8 if 16 is clean AND you need more granularity
 
 ### Step 2: Parameterize JIT Template
 **File:** `flashinfer/jit/batch_moe_gen.py`
@@ -610,9 +624,9 @@ Expected gain = (utilization improvement) × (MoE GEMM fraction) × (efficiency 
 
 ### Step 3: Add Tile Selection Function
 **File:** `flashinfer/fused_moe/core.py`
-- Add `select_tile_m_for_moe()` function using host-side heuristics
-- Start with minimal set: **[16, 128]** (2 tiles = ~40s compile)
-- Add 32/64 only after measuring real workload gains
+- Add `select_tile_m_for_moe()` function using host-side threshold
+- Start with minimal safe set: **[64, 128]** (2 tiles = ~40s compile)
+- Add 32, then 16, then 8 only after each is validated
 
 ### Step 4: Wire Through get_cutlass_fused_moe_module
 **File:** `flashinfer/fused_moe/core.py`
