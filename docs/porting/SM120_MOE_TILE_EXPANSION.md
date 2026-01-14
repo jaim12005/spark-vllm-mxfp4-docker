@@ -203,22 +203,37 @@ We need to add small-M tiles (8, 16, 32) not covered by this enum.
 
 ### 6.1 Parameterize Tile Shape in JIT Template
 
-**File:** `flashinfer/jit/batch_moe_gen.py`
+**File:** `flashinfer/jit/fused_moe.py` (NOT `batch_moe_gen.py`)
+
+**Critical refactoring needed:** The existing `gen_cutlass_fused_moe_module()` helper
+doesn't accept a custom module name. You must modify it to prevent cache collisions.
 
 ```python
-def gen_cutlass_fused_moe_sm120_module(
-    tile_m: int = 128,  # Token dimension - PARAMETERIZED FOR DECODE
-    tile_n: int = 128,  # Output dimension
+# Current signature (simplified):
+def gen_cutlass_fused_moe_module(backend: str, ...):
+    # Module name is auto-generated, doesn't include tile shape
+    ...
+
+# REQUIRED modification:
+def gen_cutlass_fused_moe_module(
+    backend: str,
+    tile_m: int = 128,  # NEW: Token dimension
+    tile_n: int = 128,  # Output dimension  
     tile_k: int = 128,  # Reduction dimension
     use_fast_build: bool = False,
 ):
-    """Generate SM120 MoE GEMM module with configurable tile shape."""
+    """Generate MoE GEMM module with configurable tile shape.
+    
+    CRITICAL: Include tile shape in module_name for cache separation.
+    Without this, all tile variants collide in the cache!
+    """
     
     # Include tile shape in cache key for separate caching
-    module_name = f"fused_moe_120_M{tile_m}_N{tile_n}_K{tile_k}"
+    # e.g., "fused_moe_120_M64_N128_K128" vs "fused_moe_120_M128_N128_K128"
+    module_name = f"fused_moe_{backend}_M{tile_m}_N{tile_n}_K{tile_k}"
     
     return JitModule(
-        name=module_name,
+        name=module_name,  # ← This is the cache key
         sources=[...],
         extra_cuda_cflags=[
             f"-DTILE_M={tile_m}",
@@ -228,6 +243,11 @@ def gen_cutlass_fused_moe_sm120_module(
         ...
     )
 ```
+
+**Why this matters:**
+- JIT cache is keyed by `module_name`
+- Without tile shape in name: `fused_moe_120` caches once, all tiles collide
+- With tile shape in name: `fused_moe_120_M64_...` and `fused_moe_120_M128_...` are separate
 
 ### 6.2 Add Tile Selection Logic in Python
 
@@ -641,9 +661,10 @@ warp-specialized scheduling. Validate from safest to riskiest:
 5. Only try 8 if 16 is clean AND you need more granularity
 
 ### Step 2: Parameterize JIT Template
-**File:** `flashinfer/jit/batch_moe_gen.py`
-- Add `tile_m` parameter (keep tile_n, tile_k fixed initially)
-- Include in cache key: `fused_moe_120_M{tile_m}_N128_K128`
+**File:** `flashinfer/jit/fused_moe.py`
+- Modify `gen_cutlass_fused_moe_module()` to accept `tile_m` parameter
+- **Critical:** Include tile_m in `module_name` for cache separation
+- Cache key format: `fused_moe_120_M{tile_m}_N128_K128`
 
 ### Step 3: Add Tile Selection Function
 **File:** `flashinfer/fused_moe/core.py`
@@ -769,6 +790,7 @@ token_selected_experts[:, :] = 0  # Expert 0 gets everything
 ## 12. References
 
 - **FlashInfer GEMM layout:** `csrc/nv_internal/.../moe_gemm_kernels.h` (line 53-55)
+- **FlashInfer MoE JIT:** `flashinfer/jit/fused_moe.py` (`gen_cutlass_fused_moe_module`)
 - **TRT-LLM tile configs:** `trtllmGen_bmm_export/config.json`
 - **llama.cpp tile selection:** `ggml-cuda/mmq.cuh:3980-4048`
 - **CUTLASS SM120 examples:** `cutlass/examples/92_blackwell_moe_gemm/`
