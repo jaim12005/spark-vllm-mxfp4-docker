@@ -411,12 +411,16 @@ using ClusterShape_MNK = CurrentTileConfig::ClusterShape_MNK;
 After running with the minimal tile set, cache will contain:
 
 ```
-~/.cache/flashinfer/0.6.0/121a/cached_ops/
-├── fused_moe_120_M64_N128_K128/     # decode / small batch (safest small tile)
+$(flashinfer_cache_dir)/cached_ops/   # Use FlashInfer's cache dir, not hardcoded path
+├── fused_moe_120_M64_N128_K128/      # decode / small batch (safest small tile)
 │   └── fused_moe_120_M64_N128_K128.so
-└── fused_moe_120_M128_N128_K128/    # prefill / large batch
+└── fused_moe_120_M128_N128_K128/     # prefill / large batch
     └── fused_moe_120_M128_N128_K128.so
 ```
+
+**Note:** The actual path varies by FlashInfer version and GPU architecture.
+Use FlashInfer's cache dir helper (e.g., `flashinfer.jit.get_cache_dir()`) rather
+than hardcoding `~/.cache/flashinfer/0.6.0/121a/...`.
 
 **Typical workload → tile mapping (gpt-oss-120b: 128 experts, top_k=8):**
 
@@ -437,26 +441,41 @@ After running with the minimal tile set, cache will contain:
 | Decode (M=1) | ~20s JIT compile | <1ms |
 | Prefill (M=2048) | ~20s JIT compile | <1ms |
 
-### 7.3 Multi-Worker Locking (REQUIRED for vLLM)
+### 7.3 Multi-Worker Locking (Check Before Implementing)
 
 vLLM runs multiple workers per GPU. Without locking, all workers race to compile:
 
 ```
-Worker 0: compiling fused_moe_120_M16...
-Worker 1: compiling fused_moe_120_M16...  ← WASTED WORK
-Worker 2: compiling fused_moe_120_M16...  ← WASTED WORK
+Worker 0: compiling fused_moe_120_M64...
+Worker 1: compiling fused_moe_120_M64...  ← WASTED WORK
+Worker 2: compiling fused_moe_120_M64...  ← WASTED WORK
 ...
 ```
 
-**Solution: File lock per module in cache directory**
+**⚠️ BEFORE IMPLEMENTING: Check if FlashInfer already has locking**
+
+```python
+# Check FlashInfer's JIT implementation for existing locks:
+# - flashinfer/jit/core.py or similar
+# - Look for fcntl, filelock, or threading.Lock usage
+# - Double-locking can cause deadlocks!
+
+# If FlashInfer already locks: DO NOTHING, just use their system
+# If FlashInfer doesn't lock: Add locking as shown below
+```
+
+**Solution (only if FlashInfer doesn't already lock):**
 
 ```python
 import fcntl
-from pathlib import Path
+from flashinfer.jit import get_cache_dir  # Use FlashInfer's helper, NOT hardcoded path
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str, tile_m: int, ...):
-    cache_dir = Path.home() / ".cache/flashinfer/0.6.0/121a/cached_ops"
+    # ❌ DON'T hardcode: Path.home() / ".cache/flashinfer/0.6.0/121a/..."
+    # ✅ DO use FlashInfer's cache dir helper (version/arch agnostic)
+    cache_dir = get_cache_dir()  # Or however FlashInfer exposes this
+    
     module_name = f"fused_moe_120_M{tile_m}_N128_K128"
     lock_file = cache_dir / f"{module_name}.lock"
     
@@ -480,7 +499,11 @@ def get_cutlass_fused_moe_module(backend: str, tile_m: int, ...):
             fcntl.flock(f, fcntl.LOCK_UN)
 ```
 
-**Note:** FlashInfer's existing JIT may already have locking. Check before implementing.
+**Implementation checklist:**
+- [ ] Check if FlashInfer JIT already locks builds
+- [ ] If yes: skip adding our own lock
+- [ ] If no: use FlashInfer's cache dir helper, not hardcoded path
+- [ ] Test with multiple workers to verify no deadlock
 
 ### 7.4 Pre-warming Strategy (Recommended)
 
