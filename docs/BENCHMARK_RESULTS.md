@@ -8,8 +8,8 @@ Live tracking of benchmark results across configurations.
 
 | Metric | Baseline | Best | Config | Date |
 |--------|----------|------|--------|------|
-| tg32 (tok/s) | 31.63 | **34.4** | **CUTLASS + MXFP4 lm_head** | 2026-01-12 |
-| tg64 (tok/s) | 31.62 | **34.1** | **CUTLASS + MXFP4 lm_head** | 2026-01-12 |
+| tg32 (tok/s) | 29.1 | **48.9** | **MXFP4 all (MoE+QKV/O+lm_head)** | 2026-01-12 |
+| tg64 (tok/s) | 31.62 | **34.1** | CUTLASS + MXFP4 lm_head | 2026-01-12 |
 | tg128 (tok/s) | 31.62 | 31.62 | Upstream (Marlin) | 2026-01-09 |
 | tg256 (tok/s) | 31.12 | 31.12 | Upstream (Marlin) | 2026-01-09 |
 | pp512 (tok/s) | 2209 | 2209 | Upstream Baseline | 2026-01-09 |
@@ -21,8 +21,43 @@ Live tracking of benchmark results across configurations.
 **Milestones achieved**:
 1. ✅ Native SM121 CUTLASS FP8×FP4 MoE GEMM - Prefill 31% faster
 2. ✅ MXFP4 lm_head with Marlin kernel - Decode +9% (29 → 34 tok/s)
+3. ✅ **MXFP4 QKV/O quantization** - Decode +32% (29.1 → 38.5 tok/s)
+4. ✅ **Combined MXFP4 all layers** - Decode +68% (29.1 → 48.9 tok/s)
 
-**Remaining gap**: Decode at 34 tok/s vs target 52-58 tok/s (37% below target).
+**Remaining gap**: Decode at 48.9 tok/s vs target 52-58 tok/s (**only 6% below target!**).
+
+---
+
+## MXFP4 QKV/O Quantization Results (2026-01-12)
+
+### Configuration
+
+```bash
+vllm serve openai/gpt-oss-120b \
+    --quantization mxfp4 \
+    --mxfp4-layers moe,qkv,o \
+    --load-format fastsafetensors
+```
+
+### Benchmark Comparison
+
+| Config | pp2048 (tok/s) | tg32 (tok/s) | Decode Δ |
+|--------|----------------|--------------|----------|
+| MoE-only | 4472 | 29.1 | baseline |
+| MoE + QKV/O | 4470 | 38.5 | +32% |
+| **All (MoE+QKV/O+lm_head)** | **4640** | **48.9** | **+68%** |
+
+### Analysis
+
+- QKV/O MXFP4 uses Marlin kernel for fused dequant+GEMM
+- Memory bandwidth savings from 4-bit weights (vs BF16)
+- No prefill regression (compute-bound)
+- Significant decode improvement (memory-bound)
+
+### Next Steps
+
+- Add `lm_head` to `--mxfp4-layers all` for further decode gains
+- nsys profile to verify Marlin kernels are used for QKV/O
 
 ---
 

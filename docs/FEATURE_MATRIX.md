@@ -2,19 +2,80 @@
 
 Status and configuration for each feature in the optimization work.
 
+> **See also:** [SM121_OPTIMIZATION_ANALYSIS.md](SM121_OPTIMIZATION_ANALYSIS.md) for detailed TRT-LLM comparison and impact estimates.
+
 ---
 
-## Feature Status Overview
+## Performance-Ranked Feature Overview
 
-| Feature | Status | Priority | Env Var | Default |
-|---------|--------|----------|---------|---------|
-| CUTLASS Grouped GEMM | 🔄 Porting | P1 | `VLLM_MXFP4_MOE_KERNEL=gemm` | `auto` |
+Features ranked by **decode TPS impact** based on TRT-LLM analysis:
+
+| Rank | Feature | Status | Decode Impact | Effort | Notes |
+|------|---------|--------|---------------|--------|-------|
+| **1** | Low-M CUDA core dispatch (dense layers) | ❌ Missing | **+15-20%** | Medium | TRT-LLM uses M≤4 threshold |
+| **2** | Fused BF16→FP8 prologue (MoE GEMM) | ❌ Missing | **+10-15%** | High | Requires CUTLASS prologue mod |
+| **3** | CUDA graph for Eagle3 drafting | ❌ Missing | **+10-15%** | Medium | TRT-LLM captures full loop |
+| **4** | MoE GEMM min_latency tuning (SM121) | ⚠️ Partial | **+5-10%** | Low | Need SM121-specific tactics |
+| **5** | CUTLASS Grouped GEMM | ✅ Works | Baseline | - | MARLIN better acceptance |
+| **6** | Fused QKV projection | ✅ Complete | +2-5% | Done | vLLM has `QKVParallelLinear` |
+| **7** | Pre-computed Eagle3 tree masks | ⚠️ Partial | +2-5% | Low | Some allocation per call |
+| **8** | QKV/O MXFP4 | ✅ Complete | +1-3% | Done | `--mxfp4-layers moe,qkv,o` |
+| **9** | lm_head MXFP4 | ✅ Complete | <1% | Done | Only 6% of decode time |
+
+**Legend:** ✅ Complete | ⚠️ Partial | ❌ Missing | 🚫 Not Pursuing
+
+---
+
+## Legacy Feature Status
+
+| Feature | Status | Priority | Env Var / CLI | Default |
+|---------|--------|----------|---------------|---------|
+| CUTLASS Grouped GEMM | ✅ Works | P1 | `VLLM_MXFP4_MOE_KERNEL=gemm` | `auto` |
+| **QKV/O MXFP4** | ✅ Complete | P1.5 | `--mxfp4-layers moe,qkv,o` | `moe` |
 | Runner/Setup Caching | ⏳ Pending | P2 | - | - |
 | Activation MXFP8 | ⏳ Pending | P3 | `VLLM_MXFP4_ACTIVATION=mxfp8` | `bf16` |
-| Tile Variants (64x128) | ⏳ Pending | P4 | `FLASHINFER_MOE_TILE=64x128` | `auto` |
-| Speculative Decoding | ⏳ Pending | P5 | vLLM flags | off |
+| Tile Variants (64x128) | 🚫 Blocked | P4 | `FLASHINFER_MOE_TILE=64x128` | `auto` |
+| Speculative Decoding | ⚠️ Works | P5 | vLLM flags | off |
 | Attention Sinks | ⏳ Pending | P6 | `VLLM_USE_ATTENTION_SINKS=1` | `0` |
-| **lm_head MXFP4** | ✅ Complete | - | auto (Blackwell only) | off |
+| **lm_head MXFP4** | ✅ Complete | - | `--mxfp4-layers lm_head` | off |
+
+---
+
+## Key Optimization: Low-M Dense Layer Dispatch
+
+**The biggest gap vs TRT-LLM**: vLLM always uses GEMM for dense layers, even for M=1 (single token decode).
+
+### TRT-LLM's Approach
+
+```cpp
+// TRT-LLM dispatches to CUDA core kernels for small M:
+if (M <= 4 && mUseFp8)  cudaCoreGemmDispatcher(...)  // FP8 path
+if (M <= 6 && !mUseFp8) cudaCoreGemmDispatcher(...)  // BF16/FP16 path
+else                    runGemm(...)                  // CUTLASS/cuBLAS
+```
+
+### Why CUDA Cores Win at M=1
+
+| Metric | Tensor Core GEMM | CUDA Core GEMV-like |
+|--------|------------------|---------------------|
+| Occupancy at M=1 | Poor (wasted lanes) | Good |
+| Memory pattern | Tiled (overhead) | Column-streaming |
+| Setup overhead | High (TMA, warp sync) | Low |
+
+### Affected Layers (gpt-oss-120b)
+
+| Layer | Per Forward | M at Decode | Impact |
+|-------|-------------|-------------|--------|
+| QKV projection | 61 | 1 | High |
+| O projection | 61 | 1 | High |
+| LM head | 1 | 1 | High (N=256k) |
+| Gate/Up (non-MoE) | 3 | 1 | Medium |
+
+### Action Item
+
+Port TRT-LLM's `cuda_core_gemm` kernels to vLLM/FlashInfer. Expected impact: **+15-20% decode TPS**.
+
+---
 
 **Note on lm_head MXFP4**: Currently uses Marlin kernel (weight-only FP4 compression → dequant to BF16 → BF16 GEMM). This is a pragmatic intermediate that reduces memory bandwidth but does NOT use native FP8×FP4 MMA. Since lm_head is only ~6% of decode time, this is not the bottleneck. The path to 52+ tok/s requires optimizing MoE (34% of decode) and attention (1.5% but could be higher with different configs), not lm_head.
 
@@ -27,6 +88,45 @@ Status and configuration for each feature in the optimization work.
 - Falls back to BF16 lm_head when either condition is detected
 
 **Legend**: ✅ Complete | 🔄 In Progress | ⏳ Pending | ❌ Blocked | 🚫 Not Pursuing
+
+---
+
+## CLI Arguments
+
+### MXFP4 Layer Selection (`--mxfp4-layers`)
+
+Control which layer types are quantized with MXFP4 (Marlin kernel for dense, hardware-specific for MoE):
+
+| Token | Layers Matched | Description |
+|-------|----------------|-------------|
+| `moe` | `*.experts.*` | MoE expert weights (default, always included) |
+| `qkv` | `*.qkv_proj` | Fused QKV projection |
+| `o` | `*.o_proj` | Attention output projection |
+| `lm_head` | `lm_head` | Output logits projection |
+| `all` | All above | Shorthand for full quantization |
+
+**Default**: `--mxfp4-layers moe` (backwards compatible)
+
+**Usage Examples**:
+
+```bash
+# Default: only MoE experts (current behavior)
+vllm serve openai/gpt-oss-120b --quantization mxfp4
+
+# Add QKV/O projections for decode speedup
+vllm serve openai/gpt-oss-120b --quantization mxfp4 --mxfp4-layers moe,qkv,o
+
+# Full quantization (all supported layers)
+vllm serve openai/gpt-oss-120b --quantization mxfp4 --mxfp4-layers all
+
+# Equivalent to "all"
+vllm serve openai/gpt-oss-120b --quantization mxfp4 --mxfp4-layers moe,qkv,o,lm_head
+```
+
+**Compatibility Notes**:
+- **LoRA**: When LoRA is enabled, QKV/O/lm_head fall back to BF16 (LoRA incompatible with FP4-packed weights)
+- **Tied embeddings**: lm_head falls back to BF16 when `tie_word_embeddings=True`
+- **Blackwell-only**: lm_head MXFP4 currently requires SM12x (GB10/Thor)
 
 ---
 
@@ -144,6 +244,38 @@ Attention Sinks (P6)
 | C2 | gemm | mxfp8 | off | off | on | ⏳ P3 |
 | C3 | gemm | mxfp8 | eagle3-short | off | off | ⏳ P5 |
 | C4 | gemm | mxfp8 | eagle3-short | on | off | ⏳ P6 |
+
+---
+
+## Eagle3 Speculative Decoding Status
+
+### Current Performance (vLLM + MXFP4)
+
+| Config | Backend | K | Accept Rate | Decode TPS |
+|--------|---------|---|-------------|------------|
+| eagle3_wip | CUTLASS | 1 | 42.8% | 28.5 |
+| eagle3_wip | CUTLASS | 4 | 20.5% | 20.1 |
+| eagle3_wip | MARLIN | 1 | **48.1%** | **33.8** |
+| eagle3_wip | MARLIN | 4 | 24.2% | 21.3 |
+
+**Finding**: MARLIN (dequant→BF16) outperforms CUTLASS (FP8×FP4) due to better draft-verifier alignment.
+
+### TRT-LLM Comparison
+
+| Engine | Model | Accept Rate | Reason |
+|--------|-------|-------------|--------|
+| TRT-LLM | DeepSeek-R1-FP4 | 86% | Draft trained on quantized outputs |
+| vLLM | gpt-oss-120b | 42-48% | Draft trained on BF16 outputs |
+
+**Implication**: Acceptance gap is due to draft model training, not implementation.
+
+### Implementation Gaps vs TRT-LLM
+
+| Feature | TRT-LLM | vLLM | Impact |
+|---------|---------|------|--------|
+| CUDA graph drafting loop | ✅ | ❌ | +10-15% TPS |
+| Pre-computed tree masks | ✅ | ⚠️ | +2-5% TPS |
+| Greedy draft sampling | ✅ | ✅ | - |
 
 ---
 

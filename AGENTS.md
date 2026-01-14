@@ -20,6 +20,11 @@ Make **vLLM the fastest inference engine for gpt-oss-120b** on NVIDIA GB10 (SM12
 
 ---
 
+## notes
+- we do not require time estimates in plans
+- avoid self-promotion like 'ai-assisted'
+- do not generate copywrites in new files
+
 ## Implementation Stack
 
 ### WE ARE USING

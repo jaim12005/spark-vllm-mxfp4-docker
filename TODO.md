@@ -36,3 +36,4 @@ For the initial testing, this might be okay - we can start with the basic mode a
 - support swap?
 - configure the cutlass autotuner
 - Investigate mxfp8_quantize location in the pipeline
+- Review comments for unnecessary optimization pivot entries
