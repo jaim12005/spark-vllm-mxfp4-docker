@@ -523,6 +523,41 @@ def prewarm_moe_tiles():
 
 ## 8. Expected Performance Impact
 
+### 8.0 REQUIRED: Measure MoE GEMM Fraction First
+
+**Before implementing ANY tile variants, measure the baseline:**
+
+```bash
+# Option 1: Nsight Systems (most accurate)
+nsys profile -o decode_profile \
+  python -c "import vllm; ... # run decode workload"
+nsys stats decode_profile.nsys-rep --report cuda_gpu_kern_sum
+
+# Option 2: NVTX ranges (if instrumented)
+# Look for moe_gemm or cutlass kernel names
+
+# Option 3: torch.profiler with CUDA activities
+with torch.profiler.profile(activities=[ProfilerActivity.CUDA]) as prof:
+    # run decode
+print(prof.key_averages().table(sort_by="cuda_time_total"))
+```
+
+**Decision gate:**
+
+| MoE GEMM % of Decode | Action |
+|---------------------|--------|
+| **< 10%** | ❌ STOP - not worth optimizing tiles |
+| **10-30%** | ⚠️ Proceed cautiously, expect modest gains |
+| **> 30%** | ✅ Tile optimization is worthwhile |
+
+**From prior analysis (Section 3.2 of SM121_OPTIMIZATION_ANALYSIS.md):**
+- MoE GEMM estimated at ~61% of decode time
+- This justifies tile optimization work
+
+**Re-measure after each change** to validate actual gains.
+
+---
+
 ### 8.1 M-Dimension Utilization Improvement
 
 **Per-expert M (tokens routed to each expert):**
@@ -536,16 +571,29 @@ def prewarm_moe_tiles():
 
 *Conservative starting point. Smaller tiles (8) may work but require validation.
 
-**Note:** These are per-expert M values after routing, not total input tokens.
-Actual improvement depends on whether smaller tiles compile and perform well.
+**⚠️ Utilization improvement ≠ throughput improvement**
+- Higher utilization reduces wasted compute
+- But kernel launch overhead, memory bandwidth, and other factors also matter
+- Actual tok/s gain will be lower than utilization gain suggests
 
-### 8.2 Projected Decode Throughput
+**Note:** These are per-expert M values after routing, not total input tokens.
+
+### 8.2 Projected Decode Throughput (Conditional)
+
+**Only valid if MoE GEMM is >30% of decode time:**
 
 | Configuration | Decode (tok/s) | Notes |
 |---------------|----------------|-------|
 | Current (TILE_M=128 only) | ~50 | Baseline |
-| After JIT M-tile selection | **52-56** | +4-12% |
+| After JIT M-tile selection | **52-56** | +4-12% (if MoE is ~60% of decode) |
 | + mainloop tuning | **54-58** | +8-16% |
+
+**Scaling formula:**
+```
+Expected gain = (utilization improvement) × (MoE GEMM fraction) × (efficiency factor)
+              ≈ 8× × 0.6 × 0.1  (very rough)
+              ≈ 50% theoretical → 5-10% realistic
+```
 
 ---
 
