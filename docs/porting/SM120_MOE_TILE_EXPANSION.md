@@ -62,14 +62,20 @@ namespace sm120_mxfp4_bf16_128x128x128 {
 
 ### Why TILE_M=128 Is Suboptimal for Decode
 
-| M (tokens) | Current TILE_M | M-Dimension Utilization | Padding Waste |
-|------------|----------------|-------------------------|---------------|
+**Key insight:** In MoE grouped GEMM, M is **tokens per expert after routing**,
+not total input tokens. For decode with 1 token and top_k=8:
+- 8 experts each get M=1
+- 120 experts get M=0 (skipped)
+- Each active expert runs a GEMM with M=1
+
+| Tokens/Expert | Current TILE_M | M-Dimension Utilization | Padding Waste |
+|---------------|----------------|-------------------------|---------------|
 | 1 | 128 | 0.8% | 127 token slots wasted |
 | 2 | 128 | 1.6% | 126 token slots wasted |
 | 4 | 128 | 3.1% | 124 token slots wasted |
 | 8 | 128 | 6.3% | 120 token slots wasted |
 
-For decode (M=1), we compute a 128×N output tile but only need 1×N.
+For decode (1 token per expert), we compute a 128×N output tile but only need 1×N.
 **99.2% of the tile computation is wasted padding.**
 
 ---
@@ -225,27 +231,60 @@ def gen_cutlass_fused_moe_sm120_module(
 
 **File:** `flashinfer/fused_moe/core.py`
 
+**CRITICAL:** For MoE grouped GEMM, the relevant M is **tokens per expert after routing**,
+not total tokens. Each expert runs its own GEMM with its own M value.
+
 ```python
-def select_tile_m_for_tokens(num_tokens: int) -> int:
-    """Select optimal TILE_M based on number of tokens (M dimension).
+def select_tile_m_for_moe(
+    total_tokens_including_expert: torch.Tensor,  # Shape: [num_experts + 1]
+    num_experts: int,
+) -> int:
+    """Select optimal TILE_M based on max tokens per expert (group size).
     
-    Uses thresholding: pick smallest tile that covers all tokens in one tile.
-    This minimizes both padding waste AND number of tile launches.
+    In MoE grouped GEMM:
+    - total_tokens_including_expert[i+1] - total_tokens_including_expert[i] = tokens for expert i
+    - The GEMM for each expert has M = tokens_for_that_expert
+    - We pick TILE_M based on the MAXIMUM group size (worst case)
     
-    Mapping:
-      M=1-8   → TILE_M=8   (1 tile, ≤7 slots wasted)
-      M=9-16  → TILE_M=16  (1 tile, ≤7 slots wasted)
-      M=17-32 → TILE_M=32  (1 tile, ≤15 slots wasted)
-      M=33-64 → TILE_M=64  (1 tile, ≤31 slots wasted)
-      M=65+   → TILE_M=128 (prefill-optimized)
+    Example (decode with 1 token, top_k=8, 128 experts):
+    - 8 experts get 1 token each (M=1)
+    - 120 experts get 0 tokens (M=0, skipped)
+    - max_tokens_per_expert = 1 → TILE_M = 8
+    
+    Example (prefill with 2048 tokens, top_k=8, 128 experts):
+    - ~16384 expert-token pairs distributed across 128 experts
+    - Average ~128 per expert, max might be ~200-300
+    - max_tokens_per_expert = 250 → TILE_M = 128
     """
-    VALID_TILE_M = [8, 16, 32, 64, 128]
+    # Compute tokens per expert from cumulative offsets
+    # total_tokens_including_expert is the cumsum of tokens per expert
+    tokens_per_expert = (
+        total_tokens_including_expert[1:] - total_tokens_including_expert[:-1]
+    )
     
+    # Use max as the tile selection signal
+    # (could also use p90 for less sensitivity to outliers)
+    max_tokens_per_expert = tokens_per_expert.max().item()
+    
+    # Threshold to tile size
+    VALID_TILE_M = [8, 16, 32, 64, 128]
     for tile_m in VALID_TILE_M:
-        if num_tokens <= tile_m:
+        if max_tokens_per_expert <= tile_m:
             return tile_m
     
-    return 128  # Fallback for large batches
+    return 128  # Fallback for large groups
+```
+
+**Alternative: Use p90 instead of max**
+```python
+# Less sensitive to outlier experts with unusual token counts
+p90_tokens = torch.quantile(tokens_per_expert.float(), 0.9).item()
+```
+
+**Why max (or p90) matters:**
+- The grouped GEMM launches one kernel for ALL experts
+- The tile shape must accommodate the LARGEST group
+- Small groups get padded to the tile size anyway
 
 
 @functools.cache
@@ -281,16 +320,19 @@ def cutlass_fused_moe(
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
     fc2_expert_weights: torch.Tensor,
+    total_tokens_including_expert: torch.Tensor,  # Routing cumsum
+    num_experts: int,
     output_dtype: torch.dtype = torch.bfloat16,
-    auto_tile_select: bool = True,  # Enable dynamic M-tile selection
+    auto_tile_select: bool = True,
     activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
     
-    num_tokens = input.shape[0]  # This becomes M in the GEMM
-    
-    # Select optimal TILE_M based on token count
+    # Select optimal TILE_M based on max tokens PER EXPERT (not total tokens)
     if auto_tile_select:
-        tile_m = select_tile_m_for_tokens(num_tokens)
+        tile_m = select_tile_m_for_moe(
+            total_tokens_including_expert,
+            num_experts,
+        )
     else:
         tile_m = 128  # Default (prefill-optimized)
     
@@ -304,6 +346,9 @@ def cutlass_fused_moe(
     # Launch kernel
     return module.run(input, ...)
 ```
+
+**Note:** `total_tokens_including_expert` is already computed during MoE routing
+(it's the cumsum of tokens per expert, used to index into the permuted activation buffer).
 
 ### 6.4 Update C++ Template to Accept Tile Parameters
 
@@ -341,24 +386,30 @@ using ClusterShape_MNK = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
 ### 7.1 Cache Structure
 
-After running with different token counts, cache will contain:
+After running with different workloads, cache will contain:
 
 ```
 ~/.cache/flashinfer/0.6.0/121a/cached_ops/
-├── fused_moe_120_M8_N128_K128/      # M ∈ [1, 8]   - decode
+├── fused_moe_120_M8_N128_K128/      # max_tokens_per_expert ∈ [1, 8]
 │   └── fused_moe_120_M8_N128_K128.so
-├── fused_moe_120_M16_N128_K128/     # M ∈ [9, 16]  - decode
+├── fused_moe_120_M16_N128_K128/     # max_tokens_per_expert ∈ [9, 16]
 │   └── fused_moe_120_M16_N128_K128.so
-├── fused_moe_120_M32_N128_K128/     # M ∈ [17, 32] - small batch
+├── fused_moe_120_M32_N128_K128/     # max_tokens_per_expert ∈ [17, 32]
 │   └── fused_moe_120_M32_N128_K128.so
-├── fused_moe_120_M64_N128_K128/     # M ∈ [33, 64] - medium batch
+├── fused_moe_120_M64_N128_K128/     # max_tokens_per_expert ∈ [33, 64]
 │   └── fused_moe_120_M64_N128_K128.so
-└── fused_moe_120_M128_N128_K128/    # M ∈ [65, ∞)  - prefill
+└── fused_moe_120_M128_N128_K128/    # max_tokens_per_expert ∈ [65, ∞)
     └── fused_moe_120_M128_N128_K128.so
 ```
 
-**Thresholding guarantees:** Each M value maps to exactly one tile, and that tile
-covers all tokens in a single CTA (no multi-tile overhead for decode).
+**Typical workload → tile mapping:**
+| Workload | Total Tokens | top_k | Experts | Max/Expert | TILE_M |
+|----------|--------------|-------|---------|------------|--------|
+| Decode (1 req) | 1 | 8 | 128 | 1 | **8** |
+| Decode (8 req) | 8 | 8 | 128 | ~1-2 | **8** |
+| Small batch | 32 | 8 | 128 | ~2-4 | **8** |
+| Medium batch | 128 | 8 | 128 | ~8-12 | **16** |
+| Prefill | 2048 | 8 | 128 | ~128-200 | **128** |
 
 ### 7.2 First-Call vs Cached Performance
 
@@ -385,12 +436,18 @@ def prewarm_moe_tiles():
 
 ### 8.1 M-Dimension Utilization Improvement
 
-| M (tokens) | Old TILE_M | New TILE_M | Utilization | Improvement |
-|------------|------------|------------|-------------|-------------|
-| 1 | 128 | 8 | 0.8% → 12.5% | **+15× util** |
+**Per-expert M (tokens routed to each expert):**
+
+| Max Tokens/Expert | Old TILE_M | New TILE_M | Utilization | Improvement |
+|-------------------|------------|------------|-------------|-------------|
+| 1 (decode) | 128 | 8 | 0.8% → 12.5% | **+15× util** |
 | 2 | 128 | 8 | 1.6% → 25% | **+15× util** |
 | 4 | 128 | 8 | 3.1% → 50% | **+16× util** |
 | 8 | 128 | 8 | 6.3% → 100% | **+16× util** |
+| 16 | 128 | 16 | 12.5% → 100% | **+8× util** |
+| 64 | 128 | 64 | 50% → 100% | **+2× util** |
+
+**Note:** These are per-expert M values after routing, not total input tokens.
 
 ### 8.2 Projected Decode Throughput
 
