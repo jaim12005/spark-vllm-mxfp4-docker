@@ -290,8 +290,11 @@ def select_tile_m_for_moe(
     avg_per_expert = expanded_rows / num_experts
     estimated_max = avg_per_expert * 2.5  # Skew factor (empirical)
     
-    # Threshold to tile size
-    VALID_TILE_M = [16, 32, 64, 128]
+    # Start with just 2 tiles to minimize compile time:
+    #   16  - decode/small batch
+    #   128 - prefill/large batch
+    # Add 32/64 only after measuring real workload gains
+    VALID_TILE_M = [16, 128]
     for tile_m in VALID_TILE_M:
         if estimated_max <= tile_m:
             return tile_m
@@ -447,34 +450,29 @@ using ClusterShape_MNK = CurrentTileConfig::ClusterShape_MNK;
 
 ### 7.1 Cache Structure
 
-After running with different workloads, cache will contain:
+After running with the minimal tile set, cache will contain:
 
 ```
 ~/.cache/flashinfer/0.6.0/121a/cached_ops/
-├── fused_moe_120_M8_N128_K128/      # max_tokens_per_expert ∈ [1, 8]
-│   └── fused_moe_120_M8_N128_K128.so
-├── fused_moe_120_M16_N128_K128/     # max_tokens_per_expert ∈ [9, 16]
+├── fused_moe_120_M16_N128_K128/     # decode / small batch
 │   └── fused_moe_120_M16_N128_K128.so
-├── fused_moe_120_M32_N128_K128/     # max_tokens_per_expert ∈ [17, 32]
-│   └── fused_moe_120_M32_N128_K128.so
-├── fused_moe_120_M64_N128_K128/     # max_tokens_per_expert ∈ [33, 64]
-│   └── fused_moe_120_M64_N128_K128.so
-└── fused_moe_120_M128_N128_K128/    # max_tokens_per_expert ∈ [65, ∞)
+└── fused_moe_120_M128_N128_K128/    # prefill / large batch
     └── fused_moe_120_M128_N128_K128.so
 ```
 
 **Typical workload → tile mapping (gpt-oss-120b: 128 experts, top_k=8):**
 
-| Workload | Input Tokens | Expanded Rows | Max Rows/Expert | TILE_M |
-|----------|--------------|---------------|-----------------|--------|
-| Decode (1 req) | 1 | 1×8=8 | 1 | **8** |
-| Decode (8 req) | 8 | 8×8=64 | ~1-2 | **8** |
-| Small batch | 32 | 32×8=256 | ~2-4 | **8** |
-| Medium batch | 128 | 128×8=1024 | ~8-12 | **16** |
-| Prefill | 2048 | 2048×8=16384 | ~128-200 | **128** |
+| Workload | Input Tokens | Estimated Max/Expert | TILE_M |
+|----------|--------------|---------------------|--------|
+| Decode (1-8 req) | 1-8 | 1-2 | **16** |
+| Small batch | 32 | ~4 | **16** |
+| Medium batch | 128 | ~12 | **16** |
+| Large batch | 512 | ~40 | **128** |
+| Prefill | 2048 | ~200 | **128** |
 
-**Note:** "Max Rows/Expert" depends on routing distribution. With uniform routing
-and 128 experts, max ≈ expanded_rows / 128. Real distributions may be skewed.
+**Start with 2 tiles.** Add 32/64 only if measurements show:
+1. Significant time in 32-64 range workloads
+2. Measurable latency improvement with finer tiles
 
 ### 7.2 First-Call vs Cached Performance
 
@@ -534,11 +532,27 @@ To avoid JIT latency during inference:
 
 ```python
 def prewarm_moe_tiles():
-    """Pre-compile all expected tile variants during server startup."""
-    for tile_m in [8, 16, 32, 64, 128]:
+    """Pre-compile tile variants during server startup.
+    
+    Start with just 2 tiles to minimize startup time:
+    - 16: decode and small batches
+    - 128: prefill and large batches
+    
+    At ~20s per tile, this is ~40s startup cost.
+    Add more tiles (32, 64) only after measuring real gains.
+    """
+    TILES_TO_PREWARM = [16, 128]  # Minimal set
+    for tile_m in TILES_TO_PREWARM:
         _ = get_cutlass_fused_moe_module(backend="120", tile_m=tile_m)
-    print("All MoE TILE_M variants compiled and cached")
+    print(f"Prewarmed {len(TILES_TO_PREWARM)} MoE tile variants")
 ```
+
+**Startup cost:**
+| Tiles | Compile Time | Use Case |
+|-------|--------------|----------|
+| 2 (16, 128) | ~40s | **Recommended starting point** |
+| 3 (16, 64, 128) | ~60s | Add 64 if medium batches are common |
+| 5 (8-128) | ~100s | Only if all sizes show measured gains |
 
 ---
 
@@ -627,12 +641,11 @@ Expected gain = (utilization improvement) × (MoE GEMM fraction) × (efficiency 
 3. Check vectorized epilogue constraints
 4. Compile a test kernel with each proposed tile size
 
-**Recommended validation order:**
-- ✅ 128×128×128 - known working
-- 🔬 64×128×128 - likely safe, test first
-- 🔬 32×128×128 - likely safe
-- ⚠️ 16×128×128 - may need alignment adjustments
-- ⚠️ 8×128×128 - experimental, may fail compilation or vectorization
+**Recommended validation order (minimal approach):**
+- ✅ 128×128×128 - known working (prefill)
+- 🔬 16×128×128 - validate first (decode) - may need alignment adjustments
+- ⏸️ 32, 64 - defer until 16+128 are working and measured
+- ⏸️ 8 - defer; may not work with TMA/vectorized epilogues
 
 ### Step 2: Parameterize JIT Template
 **File:** `flashinfer/jit/batch_moe_gen.py`
@@ -641,9 +654,9 @@ Expected gain = (utilization improvement) × (MoE GEMM fraction) × (efficiency 
 
 ### Step 3: Add Tile Selection Function
 **File:** `flashinfer/fused_moe/core.py`
-- Add `select_tile_m_for_moe()` function
-- Start with conservative set: [16, 32, 64, 128]
-- Add smaller tiles only after validation
+- Add `select_tile_m_for_moe()` function using host-side heuristics
+- Start with minimal set: **[16, 128]** (2 tiles = ~40s compile)
+- Add 32/64 only after measuring real workload gains
 
 ### Step 4: Wire Through get_cutlass_fused_moe_module
 **File:** `flashinfer/fused_moe/core.py`
