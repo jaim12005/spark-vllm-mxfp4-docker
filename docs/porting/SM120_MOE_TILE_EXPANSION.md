@@ -1,8 +1,9 @@
 # SM120 MoE Tile Expansion Plan
 
-## Approach: Dynamic Tile Selection (Option B)
+## Approach: JIT-Based Dynamic Tile Selection
 
-Following llama.cpp's proven approach: precompile multiple tile variants, select best at runtime.
+FlashInfer uses **JIT compilation** with disk caching, so we don't precompile variants.
+Instead, we parameterize the tile shape and let JIT compile on first use.
 
 ---
 
@@ -28,9 +29,30 @@ namespace sm120_mxfp4_bf16_128x128x128 {
 
 ---
 
-## 2. Reference Implementations
+## 2. JIT vs Precompile
 
-### 2.1 TRT-LLM MXFP4 Configs (SM100)
+| Approach | How It Works | First-call Latency | Binary Size |
+|----------|--------------|-------------------|-------------|
+| **Precompile** (llama.cpp) | All variants compiled at build time | None | Large |
+| **JIT** (FlashInfer) | Compile on first use, cache to disk | ~10-30s per tile | Small |
+
+### FlashInfer's JIT Caching
+
+FlashInfer already caches compiled kernels:
+```
+~/.cache/flashinfer/0.6.0/121a/cached_ops/
+├── fused_moe_120/
+│   ├── moe_gemm_128x128x128.so   # Current (only one)
+│   └── (future: moe_gemm_128x8x128.so, etc.)
+```
+
+**Advantage:** We compile only the tiles actually used, not all possible variants.
+
+---
+
+## 3. Reference Implementations
+
+### 3.1 TRT-LLM MXFP4 Configs (SM100)
 
 From `trtllmGen_bmm_export/config.json`:
 
@@ -41,36 +63,27 @@ From `trtllmGen_bmm_export/config.json`:
 
 **Key insight:** TRT-LLM uses **tileN=8** for decode, not 16 or 128.
 
-### 2.2 llama.cpp Dynamic Selection
+### 3.2 llama.cpp Dynamic Selection
 
-llama.cpp's approach that achieves 58 tok/s:
+llama.cpp's tile selection logic (adapted for our JIT approach):
 
 ```cpp
-// Precompile 16 variants: 8, 16, 24, 32, ..., 128
-for (int mmq_x = 8; mmq_x <= mmq_x_max; mmq_x += 8) {
-    if (mmq_x % granularity != 0 || shared_mem > smpbo) continue;
-    const int ntiles_x = (ncols_max + mmq_x - 1) / mmq_x;
-    if (ntiles_x < ntiles_x_best) {
-        mmq_x_best = mmq_x;  // Minimize padding waste
+// Select tile that minimizes padding waste
+for (int tile : {8, 16, 32, 64, 128}) {
+    int waste = (tile - (M % tile)) % tile;
+    if (waste < best_waste) {
+        best_tile = tile;
     }
 }
-switch (mmq_x_best) { /* dispatch to precompiled kernel */ }
-```
-
-**Plus dynamic warp tuning:**
-```cpp
-switch (ncols_dst) {
-    case 1..4: return 4;  // More warps for tiny problems
-    case 5..8: return 2;
-    default:   return 1;
-}
+// In llama.cpp: switch to precompiled kernel
+// In FlashInfer: JIT compile if not cached, then run
 ```
 
 ---
 
-## 3. FlashInfer Autotuner Evaluation
+## 4. FlashInfer Autotuner Evaluation
 
-### 3.1 Current Autotuner Architecture
+### 4.1 Current Autotuner Architecture
 
 FlashInfer has a sophisticated autotuner (`flashinfer/autotuner.py`):
 
@@ -86,13 +99,7 @@ class AutoTuner:
         self.profiling_cache[cache_key] = (runner_id, tactic)
 ```
 
-**Tuning config supports:**
-- Dynamic tensor dimensions (DynamicTensorSpec)
-- Bucket-based profiling (powers of 2)
-- Constraint specifications
-- Cached results per GPU model
-
-### 3.2 What's Disabled/Missing for SM120
+### 4.2 What's Disabled/Missing for SM120
 
 | Feature | SM100 (TRT-LLM) | SM120 (Current) | Benefit if Enabled |
 |---------|-----------------|-----------------|-------------------|
@@ -102,7 +109,7 @@ class AutoTuner:
 | **min_latency_mode** | ✅ Decode optimization | ❌ Not wired | +2-4 tok/s |
 | **Stage count tuning** | ✅ AUTO picks stages | ❌ Fixed AUTO | +5-15% |
 
-### 3.3 Tile Configs Defined But Not Implemented
+### 4.3 Tile Configs Defined But Not Implemented
 
 The `CutlassTileConfigSM120` enum has 6 configs, but only 1 is implemented:
 
@@ -119,106 +126,89 @@ enum class CutlassTileConfigSM120 {
 };
 ```
 
-The dispatcher falls back to 128×128×128:
-```cpp
-switch (gemmConfig.tile_config_sm120) {
-    case CtaShape128x128x128B: /* dispatch */ break;
-    default:
-        // Falls back to 128×128×128 for anything else!
-}
-```
-
-### 3.4 Recommendation: Enable Autotuner for SM120
-
-**Phase 1: Tile Expansion (this document)**
-- Implement multiple tile variants (8, 16, 32, 64, 128)
-- Add dynamic dispatch based on M
-
-**Phase 2: Integrate with Autotuner**
-- Expose tile configs as tactics
-- Let autotuner profile and cache best configs per (M, K, N, expert_count)
-
 ---
 
-## 4. Implementation Plan (Dynamic Dispatch)
+## 5. Implementation Plan (JIT-Based)
 
-### 4.1 New Tile Configurations
+### 5.1 Parameterize Tile Shape in JIT Template
 
-Following TRT-LLM's decode configs:
-
-```cpp
-// Priority tiles for decode
-namespace sm120_mxfp4_bf16_128x8x128 {
-    using TileShape_MNK = Shape<_128, _8, _128>;
-    using ClusterShape_MNK = Shape<_1, _1, _1>;
-}
-
-namespace sm120_mxfp4_bf16_128x16x128 {
-    using TileShape_MNK = Shape<_128, _16, _128>;
-    using ClusterShape_MNK = Shape<_1, _1, _1>;
-}
-
-namespace sm120_mxfp4_bf16_128x32x128 {
-    using TileShape_MNK = Shape<_128, _32, _128>;
-    using ClusterShape_MNK = Shape<_1, _1, _1>;
-}
-
-namespace sm120_mxfp4_bf16_128x64x128 {
-    using TileShape_MNK = Shape<_128, _64, _128>;
-    using ClusterShape_MNK = Shape<_1, _1, _1>;
-}
-
-// Existing (for prefill/fallback)
-namespace sm120_mxfp4_bf16_128x128x128 {
-    using TileShape_MNK = Shape<_128, _128, _128>;
-    using ClusterShape_MNK = Shape<_1, _1, _1>;
-}
-```
-
-### 4.2 Dynamic Dispatch Logic
-
-```cpp
-// Runtime tile selection (llama.cpp-style)
-template <typename T, typename WeightType, typename OutputType>
-void sm120_moe_gemm_dispatch(
-    TmaWarpSpecializedGroupedGemmInput tma_inputs,
-    int num_experts,
-    int M,  // Number of tokens (extracted from problem shape)
-    cudaStream_t stream)
-{
-    // Select tile that minimizes padding waste
-    constexpr int tile_options[] = {8, 16, 32, 64, 128};
-    int best_tile = 128;
-    int best_waste = INT_MAX;
-    
-    for (int tile : tile_options) {
-        // Check shared memory fits
-        size_t smem = smem_for_tile(tile);
-        if (smem > max_smem_per_sm) continue;
-        
-        // Calculate padding waste
-        int waste = (tile - (M % tile)) % tile;
-        if (waste < best_waste || (waste == best_waste && tile < best_tile)) {
-            best_waste = waste;
-            best_tile = tile;
-        }
-    }
-    
-    // Dispatch to precompiled kernel
-    switch (best_tile) {
-        case   8: launch_sm120_moe<8>(...);   break;
-        case  16: launch_sm120_moe<16>(...);  break;
-        case  32: launch_sm120_moe<32>(...);  break;
-        case  64: launch_sm120_moe<64>(...);  break;
-        case 128: launch_sm120_moe<128>(...); break;
-    }
-}
-```
-
-### 4.3 Python API Changes
+**File:** `flashinfer/jit/batch_moe_gen.py`
 
 ```python
-# flashinfer/fused_moe/core.py
+def gen_cutlass_fused_moe_sm120_module(
+    tile_m: int = 128,
+    tile_n: int = 128,  # NEW: Parameterized (was fixed)
+    tile_k: int = 128,
+    use_fast_build: bool = False,
+):
+    """Generate SM120 MoE GEMM module with configurable tile shape."""
+    
+    # Include tile shape in cache key for separate caching
+    module_name = f"fused_moe_120_{tile_m}x{tile_n}x{tile_k}"
+    
+    return JitModule(
+        name=module_name,
+        sources=[...],
+        extra_cuda_cflags=[
+            f"-DTILE_M={tile_m}",
+            f"-DTILE_N={tile_n}",
+            f"-DTILE_K={tile_k}",
+        ],
+        ...
+    )
+```
+
+### 5.2 Add Tile Selection Logic in Python
+
+**File:** `flashinfer/fused_moe/core.py`
+
+```python
+def select_tile_for_m(M: int) -> int:
+    """Select optimal tile_n based on number of tokens M.
+    
+    Minimizes padding waste while staying within valid tile options.
+    """
+    VALID_TILES = [8, 16, 32, 64, 128]
+    
+    best_tile = 128
+    best_waste = float('inf')
+    
+    for tile in VALID_TILES:
+        waste = (tile - (M % tile)) % tile
+        if waste < best_waste or (waste == best_waste and tile < best_tile):
+            best_waste = waste
+            best_tile = tile
+    
+    return best_tile
+
+
+@functools.cache
+def get_cutlass_fused_moe_module(
+    backend: str = "120",
+    tile_n: int = 128,  # NEW: Parameterized
+    use_fast_build: bool = False,
+):
+    """Get JIT-compiled module for specific tile configuration.
+    
+    Results are cached by (backend, tile_n), so each tile variant
+    is compiled only once and reused.
+    """
+    if backend in ("120", "121"):
+        module = gen_cutlass_fused_moe_sm120_module(
+            tile_m=128,
+            tile_n=tile_n,  # Pass tile selection
+            tile_k=128,
+            use_fast_build=use_fast_build,
+        ).build_and_load()
+    ...
+    return module
+```
+
+### 5.3 Wire Through to Kernel Launch
+
+**File:** `flashinfer/fused_moe/core.py`
+
+```python
 def cutlass_fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -226,33 +216,92 @@ def cutlass_fused_moe(
     fc1_expert_weights: torch.Tensor,
     fc2_expert_weights: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
-    # NEW: Enable decode-optimized tile selection
-    auto_tile_select: bool = True,  # Dynamic dispatch (Option B)
+    auto_tile_select: bool = True,  # NEW: Enable dynamic tile selection
     activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
+    
+    M = input.shape[0]  # Number of tokens
+    
+    # Select optimal tile based on M
+    if auto_tile_select:
+        tile_n = select_tile_for_m(M)
+    else:
+        tile_n = 128  # Default (prefill-optimized)
+    
+    # Get JIT-compiled module for this tile config
+    # Cached after first call - subsequent calls are instant
+    module = get_cutlass_fused_moe_module(
+        backend="120",
+        tile_n=tile_n,
+    )
+    
+    # Launch kernel
+    return module.run(input, ...)
 ```
 
-### 4.4 vLLM Integration
+### 5.4 Update C++ Template to Accept Tile Parameters
 
-```python
-# vllm/model_executor/layers/fused_moe/flashinfer_cutlass_moe.py
-_ = flashinfer_cutlass_fused_moe(
-    input=hidden_states,
-    token_selected_experts=topk_ids.to(torch.int),
-    token_final_scales=topk_weights,
-    fc1_expert_weights=fc1_weights,
-    fc2_expert_weights=fc2_weights,
-    output_dtype=self.out_dtype,
-    auto_tile_select=True,  # Enable dynamic tile selection
-    activation_type=activation_type,
-)
+**File:** `moe_gemm_sm120_mixed_input_launcher.inl`
+
+```cpp
+// Template parameterized by tile shape (JIT provides values)
+template <int TILE_M, int TILE_N, int TILE_K>
+namespace sm120_mxfp4_tile {
+
+using TileShape_MNK = Shape<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>;
+using ClusterShape_MNK = Shape<_1, _1, _1>;
+
+// ... rest of CUTLASS setup ...
+
+}  // namespace sm120_mxfp4_tile
 ```
 
 ---
 
-## 5. Expected Performance Impact
+## 6. JIT Caching Behavior
 
-### 5.1 Tile Utilization Improvement
+### 6.1 Cache Structure
+
+After running with different M values, cache will contain:
+
+```
+~/.cache/flashinfer/0.6.0/121a/cached_ops/
+├── fused_moe_120_128x8x128/     # Decode (M=1-8)
+│   └── fused_moe_120_128x8x128.so
+├── fused_moe_120_128x16x128/    # Decode (M=9-16)
+│   └── fused_moe_120_128x16x128.so
+├── fused_moe_120_128x32x128/    # Small batch (M=17-32)
+│   └── fused_moe_120_128x32x128.so
+├── fused_moe_120_128x64x128/    # Medium batch (M=33-64)
+│   └── fused_moe_120_128x64x128.so
+└── fused_moe_120_128x128x128/   # Prefill (M>64)
+    └── fused_moe_120_128x128x128.so
+```
+
+### 6.2 First-Call vs Cached Performance
+
+| Scenario | First Call | Cached Calls |
+|----------|------------|--------------|
+| Decode (M=1) | ~20s JIT compile | <1ms |
+| Prefill (M=2048) | ~20s JIT compile | <1ms |
+
+### 6.3 Pre-warming Strategy (Optional)
+
+To avoid JIT latency during inference:
+
+```python
+def prewarm_moe_tiles():
+    """Pre-compile all expected tile variants during server startup."""
+    for tile_n in [8, 16, 32, 64, 128]:
+        _ = get_cutlass_fused_moe_module(backend="120", tile_n=tile_n)
+    print("All MoE tile variants compiled and cached")
+```
+
+---
+
+## 7. Expected Performance Impact
+
+### 7.1 Tile Utilization Improvement
 
 | M | Old Tile | New Tile | Utilization | Improvement |
 |---|----------|----------|-------------|-------------|
@@ -261,65 +310,72 @@ _ = flashinfer_cutlass_fused_moe(
 | 4 | 128×128 | 128×8 | 3.1% → 50% | **+16× util** |
 | 8 | 128×128 | 128×8 | 6.3% → 100% | **+16× util** |
 
-### 5.2 Projected Decode Throughput
+### 7.2 Projected Decode Throughput
 
 | Configuration | Decode (tok/s) | Notes |
 |---------------|----------------|-------|
 | Current (128×128 only) | ~50 | Baseline |
-| After tile expansion | **52-56** | +4-12% |
+| After JIT tile selection | **52-56** | +4-12% |
 | + mainloop tuning | **54-58** | +8-16% |
 
 ---
 
-## 6. Implementation Steps
+## 8. Implementation Steps
 
-### Step 1: Add Tile Namespaces
-**File:** `moe_gemm_sm120_mixed_input_launcher.inl`
-- Duplicate the existing namespace for each new tile size
-- Follow the exact pattern to avoid "Error Internal" compiler bug
+### Step 1: Parameterize JIT Template
+**File:** `flashinfer/jit/batch_moe_gen.py`
+- Add `tile_m`, `tile_n`, `tile_k` parameters
+- Include in cache key (module name)
 
-### Step 2: Add Dispatch Function
-**File:** `moe_gemm_sm120_mixed_input_launcher.h`
-- Add `sm120_moe_gemm_dispatch()` with tile selection logic
-- Wire through to Python bindings
-
-### Step 3: Update Python API
+### Step 2: Add Tile Selection Function
 **File:** `flashinfer/fused_moe/core.py`
-- Add `auto_tile_select` parameter
-- Pass to C++ launcher
+- Add `select_tile_for_m(M)` function
+- Returns optimal tile from [8, 16, 32, 64, 128]
 
-### Step 4: Integrate with Autotuner (Future)
-**File:** `flashinfer/autotuner.py`
-- Expose tiles as tactics
-- Let autotuner profile and cache
+### Step 3: Wire Through get_cutlass_fused_moe_module
+**File:** `flashinfer/fused_moe/core.py`
+- Add `tile_n` parameter
+- Pass to JIT generator
+
+### Step 4: Update C++ Launcher Template
+**File:** `moe_gemm_sm120_mixed_input_launcher.inl`
+- Use preprocessor defines for tile dimensions
+- Ensure CUTLASS types work with variable tile shapes
+
+### Step 5: (Optional) Add Pre-warming
+**File:** `flashinfer/fused_moe/core.py`
+- Add `prewarm_moe_tiles()` function
+- Call during vLLM server startup
 
 ---
 
-## 7. Validation Plan
+## 9. Validation Plan
 
-1. **Compile test**: All 5 tile variants build without errors
-2. **Correctness test**: Output matches reference for each tile
-3. **Performance test**: Profile each tile for M=1,2,4,8,16,32,64,128
-4. **Integration test**: Full vLLM decode benchmark
-5. **Regression test**: Ensure prefill performance maintained
+1. **JIT compile test**: Each tile variant compiles without errors
+2. **Cache test**: Verify separate .so files per tile config
+3. **Correctness test**: Output matches reference for each tile
+4. **Performance test**: Profile each tile for M=1,2,4,8,16,32,64,128
+5. **Integration test**: Full vLLM decode benchmark
+6. **Regression test**: Ensure prefill performance maintained
 
 ---
 
-## 8. Risks and Mitigations
+## 10. Risks and Mitigations
 
 | Risk | Mitigation |
 |------|------------|
 | Compiler "Error Internal" | Follow existing namespace pattern exactly |
-| JIT cache explosion | 5 tiles × 2 dtypes = 10 kernels (acceptable) |
-| Shared memory overflow | Check SMEM before dispatch, fallback to smaller tile |
-| Performance regression | Benchmark each tile variant before merge |
+| First-call JIT latency | Pre-warm during server startup |
+| Cache key collision | Include full tile shape in module name |
+| CUTLASS tile incompatibility | Test each tile shape individually |
 
 ---
 
-## 9. References
+## 11. References
 
 - **TRT-LLM tile configs:** `trtllmGen_bmm_export/config.json`
-- **llama.cpp dynamic dispatch:** `ggml-cuda/mmq.cuh:3980-4048`
+- **llama.cpp tile selection:** `ggml-cuda/mmq.cuh:3980-4048`
 - **CUTLASS SM120 examples:** `cutlass/examples/92_blackwell_moe_gemm/`
+- **FlashInfer JIT system:** `flashinfer/jit/`
 - **FlashInfer autotuner:** `flashinfer/autotuner.py`
 - **Current launcher:** `moe_gemm_sm120_mixed_input_launcher.inl`
