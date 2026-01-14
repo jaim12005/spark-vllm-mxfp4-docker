@@ -16,6 +16,47 @@ This is suboptimal for decode (batch_size=1-2) where M is very small. Larger til
 - More shared memory usage than needed
 - Higher latency (larger tiles take longer to complete)
 
+## Reference: TRT-LLM MXFP4 Configs (SM100)
+
+From `trtllmGen_bmm_export/config.json`:
+
+| Template | mmaM | tileN | tileK | mmaK | Cluster | Use Case |
+|----------|------|-------|-------|------|---------|----------|
+| `BatchedGemmMxE2m1E4m3LowLatency` | 128 | **8** | 512 | 32 | 1 | **Decode** |
+| `BatchedGemmMxE2m1MxE4m3LowLatency` | 128 | **8** | 512 | 32 | 1 | **Decode** |
+| `BatchedGemmMxE2m1MxE4m3HighThroughput` | **256** | 8 | 512 | 32 | **2** | Prefill |
+| `BatchedGemmMxE2m1Bf16LowLatency` | 128 | 8 | 256 | 16 | 1 | BF16 path |
+
+**Key observations:**
+- TRT-LLM uses **tileN=8** for decode (smaller than CUTLASS example's 16)
+- tileK=512 for FP4/FP8 paths
+- Scale factor layout: "8x4" (sfLayoutB/sfLayoutC)
+
+## Reference: llama.cpp Dynamic Tile Selection
+
+llama.cpp uses **runtime tile selection** instead of hardcoded tiles:
+
+```cpp
+// Precompile 16 variants: 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128
+for (int mmq_x = 8; mmq_x <= mmq_x_max; mmq_x += 8) {
+    if (mmq_x % granularity != 0 || shared_mem > smpbo) continue;
+    const int ntiles_x = (ncols_max + mmq_x - 1) / mmq_x;
+    if (ntiles_x < ntiles_x_best) {
+        mmq_x_best = mmq_x;  // Pick tile minimizing waste
+    }
+}
+switch (mmq_x_best) { ... }  // Dispatch to precompiled kernel
+```
+
+**Plus dynamic warp count** (`calc_nwarps`):
+```cpp
+switch (ncols_dst) {
+    case 1..4: return 4;  // More warps for small problems
+    case 5..8: return 2;
+    default:   return 1;
+}
+```
+
 ## Current Performance
 
 | M | Current Tile | Utilization | Latency |
@@ -27,24 +68,28 @@ This is suboptimal for decode (batch_size=1-2) where M is very small. Larger til
 
 ## Proposed Solution
 
-Add decode-oriented tile configurations following TRT-LLM's approach:
+Add decode-oriented tile configurations following TRT-LLM/llama.cpp approaches:
 
 ### New Tile Configurations
 
+Following TRT-LLM's configs (tileN=8 for decode, tileK=512):
+
 ```cpp
-// Small-N tiles for decode (M=1-4)
-namespace sm120_mxfp4_bf16_128x8x128 {
-    using TileShape_MNK = Shape<_128, _8, _128>;
+// Decode tile: 128×8×512 (matches TRT-LLM BatchedGemmMxE2m1E4m3LowLatency)
+namespace sm120_mxfp4_bf16_128x8x512 {
+    using TileShape_MNK = Shape<_128, _8, _512>;
+    using ClusterShape_MNK = Shape<_1, _1, _1>;
+    // sfLayoutB = "8x4" for block scales
+}
+
+// Intermediate tiles for gradual scaling
+namespace sm120_mxfp4_bf16_128x16x256 {
+    using TileShape_MNK = Shape<_128, _16, _256>;
     using ClusterShape_MNK = Shape<_1, _1, _1>;
 }
 
-namespace sm120_mxfp4_bf16_128x16x128 {
-    using TileShape_MNK = Shape<_128, _16, _128>;
-    using ClusterShape_MNK = Shape<_1, _1, _1>;
-}
-
-namespace sm120_mxfp4_bf16_128x32x128 {
-    using TileShape_MNK = Shape<_128, _32, _128>;
+namespace sm120_mxfp4_bf16_128x32x256 {
+    using TileShape_MNK = Shape<_128, _32, _256>;
     using ClusterShape_MNK = Shape<_1, _1, _1>;
 }
 
@@ -52,26 +97,72 @@ namespace sm120_mxfp4_bf16_128x64x128 {
     using TileShape_MNK = Shape<_128, _64, _128>;
     using ClusterShape_MNK = Shape<_1, _1, _1>;
 }
+
+// High-throughput prefill tile (matches TRT-LLM HighThroughput)
+namespace sm120_mxfp4_bf16_256x8x512 {
+    using TileShape_MNK = Shape<_256, _8, _512>;
+    using ClusterShape_MNK = Shape<_2, _1, _1>;  // 2x cluster for throughput
+}
 ```
 
-### Tile Selection Logic
+### Option A: Static Threshold Dispatch (Simple)
 
 ```cpp
 // Select tile based on M (number of tokens)
-TileConfig selectTileForDecode(int M) {
-    if (M <= 8) {
-        return TileConfig::_128x8x128;
-    } else if (M <= 16) {
-        return TileConfig::_128x16x128;
-    } else if (M <= 32) {
-        return TileConfig::_128x32x128;
-    } else if (M <= 64) {
-        return TileConfig::_128x64x128;
+TileConfig selectTileForDecode(int M, bool min_latency_mode) {
+    if (min_latency_mode && M <= 8) {
+        return TileConfig::_128x8x512;   // Decode
+    } else if (min_latency_mode && M <= 32) {
+        return TileConfig::_128x32x256;
+    } else if (M > 256) {
+        return TileConfig::_256x8x512;   // Prefill (high throughput)
     } else {
-        return TileConfig::_128x128x128;  // Default for prefill
+        return TileConfig::_128x128x128; // Default
     }
 }
 ```
+
+### Option B: Dynamic Selection (llama.cpp-style)
+
+Precompile multiple tiles, select best at runtime:
+
+```cpp
+// Precompile: 8, 16, 32, 64, 128 tiles
+template <int TileN>
+void launch_moe_gemm(...);
+
+void dispatch_moe_gemm(int M, int N, int K, ...) {
+    const int tile_options[] = {8, 16, 32, 64, 128};
+    int best_tile = 128;
+    int best_waste = INT_MAX;
+    
+    for (int tile : tile_options) {
+        if (smem_for_tile(tile) > max_smem) continue;
+        int waste = (tile - (M % tile)) % tile;  // Padding waste
+        if (waste < best_waste) {
+            best_waste = waste;
+            best_tile = tile;
+        }
+    }
+    
+    switch (best_tile) {
+        case   8: launch_moe_gemm<  8>(...); break;
+        case  16: launch_moe_gemm< 16>(...); break;
+        case  32: launch_moe_gemm< 32>(...); break;
+        case  64: launch_moe_gemm< 64>(...); break;
+        case 128: launch_moe_gemm<128>(...); break;
+    }
+}
+```
+
+**Pros of Option B:**
+- No hardcoded thresholds
+- Automatically adapts to different batch sizes
+- Same approach proven in llama.cpp (58 tok/s!)
+
+**Cons:**
+- More kernels to compile (JIT cache larger)
+- Slightly more complex launcher
 
 ## Expected Impact
 
