@@ -462,7 +462,52 @@ and 128 experts, max ≈ expanded_rows / 128. Real distributions may be skewed.
 | Decode (M=1) | ~20s JIT compile | <1ms |
 | Prefill (M=2048) | ~20s JIT compile | <1ms |
 
-### 7.3 Pre-warming Strategy (Optional)
+### 7.3 Multi-Worker Locking (REQUIRED for vLLM)
+
+vLLM runs multiple workers per GPU. Without locking, all workers race to compile:
+
+```
+Worker 0: compiling fused_moe_120_M16...
+Worker 1: compiling fused_moe_120_M16...  ← WASTED WORK
+Worker 2: compiling fused_moe_120_M16...  ← WASTED WORK
+...
+```
+
+**Solution: File lock per module in cache directory**
+
+```python
+import fcntl
+from pathlib import Path
+
+@functools.cache
+def get_cutlass_fused_moe_module(backend: str, tile_m: int, ...):
+    cache_dir = Path.home() / ".cache/flashinfer/0.6.0/121a/cached_ops"
+    module_name = f"fused_moe_120_M{tile_m}_N128_K128"
+    lock_file = cache_dir / f"{module_name}.lock"
+    
+    # Ensure cache dir exists
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Acquire exclusive lock before build
+    with open(lock_file, 'w') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # Blocks until lock acquired
+        try:
+            # Check if another worker already compiled while we waited
+            if module_already_cached(module_name):
+                return load_cached_module(module_name)
+            
+            # We're the first - compile it
+            module = gen_cutlass_fused_moe_sm120_module(
+                tile_m=tile_m, ...
+            ).build_and_load()
+            return module
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+```
+
+**Note:** FlashInfer's existing JIT may already have locking. Check before implementing.
+
+### 7.4 Pre-warming Strategy (Recommended)
 
 To avoid JIT latency during inference:
 
@@ -571,6 +616,7 @@ Actual improvement depends on whether smaller tiles compile and perform well.
 | Compiler "Error Internal" | Follow existing namespace pattern exactly |
 | First-call JIT latency | Pre-warm during server startup |
 | Cache key collision | Include full tile shape in module name |
+| **Multi-worker JIT race** | File lock per module in cache dir (Section 7.3) |
 | **Small M-tiles don't compile** | Start with 32/64, add smaller tiles incrementally |
 | **TMA alignment violations** | Check SM120 TMA requirements (often 16-element min) |
 | **Vectorized epilogue fails** | May need N≥16; test before assuming N=8 works |
