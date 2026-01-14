@@ -13,14 +13,16 @@ This document compares our vLLM/FlashInfer SM121 implementation against **llama.
 | vLLM + Marlin + FlashInfer | Marlin MoE, BF16 dense | 4341 | 32.6 |
 | **vLLM + MXFP4 all** | **CUTLASS MoE + Marlin QKV/O/lm_head** | **4580** | **48.6** ✓ |
 | vLLM + MXFP4 all + FP8 KV | CUTLASS MoE + FP8 KV cache | 4520 | 49.0 |
+| **vLLM + CUDA graphs** | **CUTLASS MoE + FP8 KV + graphs** | **4540** | **50.5** ✓ |
 
 **Key findings:**
-1. **49.0 tok/s achieved** with full MXFP4 quantization + FP8 KV cache
+1. **50.5 tok/s achieved** with full MXFP4 + FP8 KV cache + CUDA graphs
 2. QKV/O quantization gave +32% decode improvement (29.1 → 38.5 tok/s)
 3. Adding lm_head gave +27% additional (38.5 → 48.9 tok/s)
-4. **FP8 KV cache adds only +0.3 t/s** — attention is NOT the bottleneck at batch_size=2
+4. FP8 KV cache adds only +0.3 t/s — attention is NOT the bottleneck at batch_size=2
+5. **CUDA graphs add +1.5 t/s** (48.96 → 50.50) — kernel launch overhead reduction
 
-**Remaining gap:** ~3-9 tok/s to match SGLang (52) / llama.cpp (58) — **only 6-16% improvement needed!**
+**Remaining gap:** ~1.5-7.5 tok/s to match SGLang (52) / llama.cpp (58) — **only 3-15% improvement needed!**
 
 ---
 
@@ -858,7 +860,7 @@ For SM121 with native FP8×FP4 MMA, dequant path is suboptimal but works.
 |------|---------------|--------|--------|--------|
 | ~~Verify attention backend + sinks path; evaluate FP8 KV cache~~ | ~~+1-3 tok/s~~ | Low | ✅ **Done** (+0.3 t/s) | §A |
 | Add greedy draft sampling option | +2-3 tok/s | Low | Pending | TRT-LLM §5 |
-| Verify/enable CUDA graphs on SM121 *and ensure graph hit-rate* | +1-2 tok/s | Low | Pending | §3 + §B |
+| ~~Verify/enable CUDA graphs on SM121~~ | ~~+1-2 tok/s~~ | Low | ✅ **Done** (+1.5 t/s) | §3 + §B |
 | **Port `VerifyTreeGreedy` CUDA kernel** | +1-2 tok/s | Low-Med | Pending | **SGLang** |
 | **Use bitpacked tree masks** | +0.5-1 tok/s | Low | Pending | **SGLang** |
 | Verify Eagle3 buffer allocation | +0.5-1 tok/s | Low | Pending | §8 |
@@ -980,7 +982,7 @@ __global__ void build_tree_efficient_partial_packed(
 
 ## Summary
 
-**Current best:** 49.0 tok/s (vLLM + MXFP4 all layers + FP8 KV) — **only 6% below SGLang target!**
+**Current best:** 50.5 tok/s (vLLM + MXFP4 all + FP8 KV + CUDA graphs) — **only 3% below SGLang target!**
 
 **Model:** gpt-oss-120b (hidden=2880, 36 layers, 128 experts, 4/token, vocab=201088)
 
@@ -990,6 +992,7 @@ __global__ void build_tree_efficient_partial_packed(
 - ✅ MXFP4 lm_head with Marlin (+27% additional improvement)
 - ✅ Fused QKV projection
 - ✅ FP8 E4M3 KV cache with attention sinks (+0.3 t/s, minimal — attention not bottleneck)
+- ✅ CUDA graphs enabled (+1.5 t/s) — removes `--enforce-eager`, enables graph capture
 
 **Quick wins (Phase 1) — from TRT-LLM + SGLang:**
 0. ~~**Attention sanity & knobs**~~ — ✅ Done. FP8 KV cache tested, +0.3 t/s (not bottleneck at bs=2)
@@ -1011,12 +1014,14 @@ __global__ void build_tree_efficient_partial_packed(
 12. **Optimize tree drafting** — Compare vLLM vs TRT-LLM vs SGLang approach (+3-5 tok/s) — Medium effort
 
 **Projected trajectory:**
-- Phase 1: 49.0 → **52-55 tok/s** (matches/exceeds SGLang!)
+- Phase 1: 50.5 → **52-55 tok/s** (1.5 t/s remaining to match SGLang!)
 - Phase 2: 52-55 → **58-64 tok/s** (exceeds llama.cpp!)
 - Phase 3: 58-64 → **65-72 tok/s** (with speculative decode)
 
-**Key learning from FP8 KV cache testing:** Attention is NOT the bottleneck at batch_size=2 for MoE models.
-MoE GEMM dominates decode time. Focus remaining optimization effort on MoE kernel tuning (Phase 2).
+**Key learnings:**
+1. Attention is NOT the bottleneck at batch_size=2 for MoE models (FP8 KV gave only +0.3 t/s)
+2. CUDA graphs work on SM121 and give +1.5 t/s (kernel launch overhead reduction)
+3. MoE GEMM dominates decode time (~61%). Focus remaining optimization on MoE kernel tuning (Phase 2)
 
 **Key insight:** SGLang's applicable optimizations for gpt-oss-120b + SM121 are primarily in the
 **Eagle3 speculative decoding path** (tree verification, bitpacking), not MoE kernels. Most SGLang
