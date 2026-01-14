@@ -258,85 +258,53 @@ The naive approach (`rows_per_expert.max().item()`) forces a GPU sync every toke
 which is catastrophic for decode latency. Use host-side heuristics instead.
 
 ```python
-def select_tile_m_for_moe(
-    num_tokens: int,      # Host-side value (input.shape[0])
-    top_k: int,           # Host-side constant (e.g., 8)
-    num_experts: int,     # Host-side constant (e.g., 128)
-    is_decode: bool,      # True if num_tokens is small
-) -> int:
-    """Select optimal TILE_M using HOST-SIDE heuristics only.
+def select_tile_m_for_moe(num_tokens: int) -> int:
+    """Select TILE_M using simple decode vs prefill heuristic.
     
     NO GPU TENSORS, NO .item() CALLS - these sync and kill decode perf.
     
-    Heuristic: estimate max_rows_per_expert from host-known quantities.
-    
-    For uniform distribution:
-        avg_rows_per_expert = (num_tokens × top_k) / num_experts
-        
-    For skewed distribution (worst case):
-        max_rows_per_expert ≈ 2-3× average (empirical)
-    
-    For decode (small num_tokens):
-        max_rows_per_expert ≤ top_k (at most top_k experts get 1 row each)
+    Just two cases:
+    - Decode/small batch: TILE_M=16
+    - Prefill/large batch: TILE_M=128
     """
+    DECODE_THRESHOLD = 64  # Tune based on workload mix
     
-    # Fast path for decode: max is bounded by top_k
-    if is_decode or num_tokens <= 8:
-        # With 1-8 tokens and top_k=8, max per expert is at most ~top_k
-        return 16  # Conservative; could use 8 if validated
-    
-    # Heuristic for batched/prefill: estimate from average with skew factor
-    expanded_rows = num_tokens * top_k
-    avg_per_expert = expanded_rows / num_experts
-    estimated_max = avg_per_expert * 2.5  # Skew factor (empirical)
-    
-    # Start with just 2 tiles to minimize compile time:
-    #   16  - decode/small batch
-    #   128 - prefill/large batch
-    # Add 32/64 only after measuring real workload gains
-    VALID_TILE_M = [16, 128]
-    for tile_m in VALID_TILE_M:
-        if estimated_max <= tile_m:
-            return tile_m
-    
-    return 128  # Prefill uses large tiles anyway
+    if num_tokens <= DECODE_THRESHOLD:
+        return 16   # Decode-optimized
+    else:
+        return 128  # Prefill-optimized
 ```
 
-**Why host-side heuristics are safe:**
-- Picking a tile SMALLER than actual max is still correct (just uses >1 CTA along M)
-- Picking a tile LARGER than actual max wastes some compute (current behavior)
-- The heuristic errs toward slightly larger tiles, which is safer
+**Why this simple approach works:**
 
-**Alternative: Use host-side values from GEMM setup**
+1. **Correctness doesn't require tile ≥ max_rows_per_expert**
+   - If max_rows > TILE_M, CUTLASS iterates multiple CTAs along M
+   - Smaller tiles are still correct, just potentially slower
 
-Many grouped GEMM launchers already materialize per-group sizes on host when
-building the grouped GEMM input struct. If FlashInfer does this, compute max there:
+2. **Estimating max from skew can backfire**
+   - If one expert gets a big blob but most are tiny, using max pessimizes the common case
+   - p90 is better but requires GPU sync (which we can't do)
 
-```cpp
-// In moe_gemm_tma_warp_specialized_input.cu or similar
-// When building problem_shapes array, track max M
-int64_t max_m = 0;
-for (int i = 0; i < num_experts; i++) {
-    int64_t rows_for_expert = total_tokens_including_expert[i+1] 
-                            - total_tokens_including_expert[i];
-    problem_shapes[i] = make_shape(rows_for_expert, N, K);
-    max_m = std::max(max_m, rows_for_expert);
-}
-// max_m is now available on host without GPU sync
-```
+3. **Decode vs prefill covers 99% of cases**
+   - Decode: always small M per expert → TILE_M=16
+   - Prefill: large M per expert → TILE_M=128
+   - Middle ground is rare; add 32/64 only if profiling shows need
 
 **What NOT to do:**
 ```python
 # ❌ BAD: Forces GPU→CPU sync every call
 max_rows = rows_per_expert.max().item()
 
-# ❌ BAD: Also syncs
+# ❌ BAD: Also syncs  
 p90_rows = torch.quantile(rows_per_expert.float(), 0.9).item()
 
-# ❌ BAD: Even worse - multiple syncs
-for i in range(num_experts):
-    rows = (offsets[i+1] - offsets[i]).item()  # SYNC per expert!
+# ❌ BAD: Over-engineering - just use decode vs prefill threshold
+estimated_max = (num_tokens * top_k / num_experts) * skew_factor
 ```
+
+**Future optimization (if needed):**
+If profiling shows the simple threshold isn't optimal, compute max_m on host
+in the C++ GEMM setup (where per-expert sizes are already materialized).
 
 
 @functools.cache
@@ -372,8 +340,6 @@ def cutlass_fused_moe(
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
     fc2_expert_weights: torch.Tensor,
-    num_experts: int,
-    top_k: int,
     output_dtype: torch.dtype = torch.bfloat16,
     auto_tile_select: bool = True,
     activation_type: ActivationType = ActivationType.Swiglu,
@@ -381,33 +347,23 @@ def cutlass_fused_moe(
     
     num_tokens = input.shape[0]  # Host-side value, no sync
     
-    # Select optimal TILE_M using HOST-SIDE heuristics only
-    # NO GPU tensor access here - that would sync and kill perf
+    # Select TILE_M: just decode vs prefill, nothing fancy
     if auto_tile_select:
-        tile_m = select_tile_m_for_moe(
-            num_tokens=num_tokens,
-            top_k=top_k,
-            num_experts=num_experts,
-            is_decode=(num_tokens <= 8),
-        )
+        tile_m = select_tile_m_for_moe(num_tokens)
     else:
-        tile_m = 128  # Default (prefill-optimized)
+        tile_m = 128  # Default
     
     # Get JIT-compiled module for this tile config
-    # Cached after first call - subsequent calls are instant
-    module = get_cutlass_fused_moe_module(
-        backend="120",
-        tile_m=tile_m,
-    )
+    module = get_cutlass_fused_moe_module(backend="120", tile_m=tile_m)
     
     # Launch kernel
     return module.run(input, ...)
 ```
 
-**Key difference from naive approach:**
-- Uses `num_tokens`, `top_k`, `num_experts` (all host-side)
-- Does NOT access `total_tokens_including_expert` tensor
-- No `.item()` calls, no GPU sync
+**Key points:**
+- Just `num_tokens` (host-side int) → no GPU sync
+- Simple threshold: ≤64 tokens → decode tile, else prefill tile
+- No estimation of max_rows_per_expert needed
 
 ### 6.4 Update C++ Template to Accept Tile Parameters
 
