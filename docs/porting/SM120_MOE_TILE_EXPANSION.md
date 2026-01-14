@@ -232,7 +232,23 @@ def gen_cutlass_fused_moe_sm120_module(
 **File:** `flashinfer/fused_moe/core.py`
 
 **CRITICAL:** For MoE grouped GEMM, the relevant M is **tokens per expert after routing**,
-not total tokens. Each expert runs its own GEMM with its own M value.
+not total input tokens. Each expert runs its own GEMM with its own M value.
+
+### Understanding the Row Expansion
+
+```
+Input tokens:        num_tokens (e.g., 1 for decode)
+Top-k experts:       top_k (e.g., 8 for gpt-oss-120b)
+Expanded rows:       num_tokens × top_k = expanded_num_rows (e.g., 1 × 8 = 8)
+
+After routing, these 8 expert-token pairs are distributed across experts:
+- 8 active experts each get 1 row
+- 120 inactive experts get 0 rows
+```
+
+The GEMM sees the **per-expert row counts**, not total tokens or expanded rows.
+
+### Tile Selection Function
 
 ```python
 def select_tile_m_for_moe(
@@ -241,44 +257,52 @@ def select_tile_m_for_moe(
 ) -> int:
     """Select optimal TILE_M based on max tokens per expert (group size).
     
+    IMPORTANT: This function is called AFTER routing, when we know the actual
+    distribution of tokens across experts. The `total_tokens_including_expert`
+    tensor is the cumsum of tokens per expert (already computed during routing).
+    
     In MoE grouped GEMM:
-    - total_tokens_including_expert[i+1] - total_tokens_including_expert[i] = tokens for expert i
-    - The GEMM for each expert has M = tokens_for_that_expert
+    - total_tokens_including_expert[i+1] - total_tokens_including_expert[i] = rows for expert i
+    - The GEMM for each expert has M = rows_for_that_expert  
     - We pick TILE_M based on the MAXIMUM group size (worst case)
     
     Example (decode with 1 token, top_k=8, 128 experts):
-    - 8 experts get 1 token each (M=1)
-    - 120 experts get 0 tokens (M=0, skipped)
-    - max_tokens_per_expert = 1 → TILE_M = 8
+    - expanded_num_rows = 1 × 8 = 8 (but distributed across experts)
+    - 8 experts get 1 row each (M=1)
+    - 120 experts get 0 rows (M=0, skipped)
+    - max_rows_per_expert = 1 → TILE_M = 8
     
     Example (prefill with 2048 tokens, top_k=8, 128 experts):
-    - ~16384 expert-token pairs distributed across 128 experts
-    - Average ~128 per expert, max might be ~200-300
-    - max_tokens_per_expert = 250 → TILE_M = 128
+    - expanded_num_rows = 2048 × 8 = 16384 rows
+    - Distributed across 128 experts: avg ~128, max ~200-300
+    - max_rows_per_expert = 250 → TILE_M = 128
     """
-    # Compute tokens per expert from cumulative offsets
-    # total_tokens_including_expert is the cumsum of tokens per expert
-    tokens_per_expert = (
+    # Compute rows per expert from cumulative offsets
+    # This is already available from the routing step
+    rows_per_expert = (
         total_tokens_including_expert[1:] - total_tokens_including_expert[:-1]
     )
     
     # Use max as the tile selection signal
     # (could also use p90 for less sensitivity to outliers)
-    max_tokens_per_expert = tokens_per_expert.max().item()
+    max_rows_per_expert = rows_per_expert.max().item()
     
     # Threshold to tile size
     VALID_TILE_M = [8, 16, 32, 64, 128]
     for tile_m in VALID_TILE_M:
-        if max_tokens_per_expert <= tile_m:
+        if max_rows_per_expert <= tile_m:
             return tile_m
     
     return 128  # Fallback for large groups
 ```
 
+**Key insight:** We use `total_tokens_including_expert` (already computed during routing),
+NOT `input.shape[0]` (raw input tokens) or `input.shape[0] * top_k` (expanded rows).
+
 **Alternative: Use p90 instead of max**
 ```python
 # Less sensitive to outlier experts with unusual token counts
-p90_tokens = torch.quantile(tokens_per_expert.float(), 0.9).item()
+p90_rows = torch.quantile(rows_per_expert.float(), 0.9).item()
 ```
 
 **Why max (or p90) matters:**
@@ -402,14 +426,18 @@ After running with different workloads, cache will contain:
     └── fused_moe_120_M128_N128_K128.so
 ```
 
-**Typical workload → tile mapping:**
-| Workload | Total Tokens | top_k | Experts | Max/Expert | TILE_M |
-|----------|--------------|-------|---------|------------|--------|
-| Decode (1 req) | 1 | 8 | 128 | 1 | **8** |
-| Decode (8 req) | 8 | 8 | 128 | ~1-2 | **8** |
-| Small batch | 32 | 8 | 128 | ~2-4 | **8** |
-| Medium batch | 128 | 8 | 128 | ~8-12 | **16** |
-| Prefill | 2048 | 8 | 128 | ~128-200 | **128** |
+**Typical workload → tile mapping (gpt-oss-120b: 128 experts, top_k=8):**
+
+| Workload | Input Tokens | Expanded Rows | Max Rows/Expert | TILE_M |
+|----------|--------------|---------------|-----------------|--------|
+| Decode (1 req) | 1 | 1×8=8 | 1 | **8** |
+| Decode (8 req) | 8 | 8×8=64 | ~1-2 | **8** |
+| Small batch | 32 | 32×8=256 | ~2-4 | **8** |
+| Medium batch | 128 | 128×8=1024 | ~8-12 | **16** |
+| Prefill | 2048 | 2048×8=16384 | ~128-200 | **128** |
+
+**Note:** "Max Rows/Expert" depends on routing distribution. With uniform routing
+and 128 experts, max ≈ expanded_rows / 128. Real distributions may be skewed.
 
 ### 7.2 First-Call vs Cached Performance
 
