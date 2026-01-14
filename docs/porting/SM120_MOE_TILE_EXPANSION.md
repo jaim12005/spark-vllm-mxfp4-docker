@@ -658,6 +658,71 @@ warp-specialized scheduling. Validate from safest to riskiest:
 4. **Performance test**: Profile each tile for M=1,2,4,8,16,32,64,128
 5. **Integration test**: Full vLLM decode benchmark
 6. **Regression test**: Ensure prefill performance maintained
+7. **Skewed routing stress test**: See below
+
+### 10.1 Skewed Routing Stress Test
+
+The performance mapping assumes roughly uniform routing. Reality can be skewed.
+This test validates whether decode/prefill gating is sufficient.
+
+**Test case: One hot expert**
+```python
+def test_skewed_routing():
+    """Stress test: one expert gets most tokens, others get few."""
+    num_tokens = 64
+    num_experts = 128
+    top_k = 8
+    
+    # Construct skewed routing: expert 0 gets 80% of assignments
+    # This creates max_rows_per_expert >> avg_rows_per_expert
+    token_selected_experts = torch.zeros(num_tokens, top_k, dtype=torch.int32)
+    for i in range(num_tokens):
+        if i < int(num_tokens * 0.8):  # 80% to expert 0
+            token_selected_experts[i] = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7])
+        else:  # 20% distributed
+            token_selected_experts[i] = torch.randint(0, num_experts, (top_k,))
+    
+    # Expected distribution:
+    # - Expert 0: ~51 rows (80% of 64 tokens)
+    # - Other experts: ~0-2 rows each
+    # - avg_rows_per_expert ≈ 4
+    # - max_rows_per_expert ≈ 51
+    
+    # With TILE_M=64 (our decode tile):
+    # - Expert 0: 51 rows fits in one 64-tile (OK)
+    # - With TILE_M=16: would need 4 CTAs for expert 0
+    
+    # Run both tiles
+    output_64 = run_moe_with_tile(input, token_selected_experts, tile_m=64)
+    output_128 = run_moe_with_tile(input, token_selected_experts, tile_m=128)
+    
+    # Verify correctness
+    assert torch.allclose(output_64, output_128, rtol=1e-3)
+    
+    # Measure performance
+    time_64 = benchmark(lambda: run_moe_with_tile(..., tile_m=64))
+    time_128 = benchmark(lambda: run_moe_with_tile(..., tile_m=128))
+    
+    print(f"Skewed routing: TILE_M=64: {time_64:.2f}ms, TILE_M=128: {time_128:.2f}ms")
+    # If 64 is slower than 128, may need max-based selection for skewed cases
+```
+
+**What this test reveals:**
+| Result | Implication |
+|--------|-------------|
+| 64 ≈ 128 (within 10%) | Decode/prefill gating is sufficient |
+| 64 slower than 128 | May need max-based selection for skewed routing |
+| 64 much faster | Tile expansion is working as intended |
+| Correctness failure | CUTLASS multi-CTA iteration has a bug |
+
+**Extreme skew test (optional):**
+```python
+# All tokens to one expert
+token_selected_experts[:, :] = 0  # Expert 0 gets everything
+# max_rows_per_expert = num_tokens * top_k = 512
+# With TILE_M=64: needs 8 CTAs along M
+# Verify this still produces correct output
+```
 
 ---
 
