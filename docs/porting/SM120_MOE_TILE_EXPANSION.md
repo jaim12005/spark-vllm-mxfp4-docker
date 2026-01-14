@@ -109,21 +109,35 @@ From `trtllmGen_bmm_export/config.json`:
 **Note:** TRT-LLM's config format uses different naming. The key insight is they have
 separate configs for decode vs prefill, optimizing the token dimension differently.
 
-### 4.2 llama.cpp Dynamic Selection
+### 4.2 Tile Selection Strategies
 
-llama.cpp's tile selection logic (adapted for our JIT approach):
-
+**Option A: Thresholding (TRT-LLM style, recommended)**
 ```cpp
-// Select M-tile that minimizes padding waste
+// Pick smallest tile that fits all tokens in one CTA
+for (int tile_m : {8, 16, 32, 64, 128}) {
+    if (M <= tile_m) return tile_m;
+}
+return 128;
+```
+- Simple, predictable mapping
+- Guarantees single-tile coverage for decode
+- No ambiguity in bucket assignment
+
+**Option B: Min-waste with large-tile tie-break (llama.cpp style)**
+```cpp
+// Minimize padding waste, prefer larger tile on ties
 for (int tile_m : {8, 16, 32, 64, 128}) {
     int waste = (tile_m - (M % tile_m)) % tile_m;
-    if (waste < best_waste) {
+    if (waste < best_waste || (waste == best_waste && tile_m > best_tile_m)) {
+        best_waste = waste;
         best_tile_m = tile_m;
     }
 }
-// In llama.cpp: switch to precompiled kernel
-// In FlashInfer: JIT compile if not cached, then run
 ```
+- More complex, handles multi-tile scenarios
+- Larger tiles have better occupancy characteristics
+
+**We use Option A** for simplicity and decode optimization.
 
 ---
 
@@ -215,21 +229,23 @@ def gen_cutlass_fused_moe_sm120_module(
 def select_tile_m_for_tokens(num_tokens: int) -> int:
     """Select optimal TILE_M based on number of tokens (M dimension).
     
-    Minimizes padding waste in the token dimension.
+    Uses thresholding: pick smallest tile that covers all tokens in one tile.
+    This minimizes both padding waste AND number of tile launches.
+    
+    Mapping:
+      M=1-8   → TILE_M=8   (1 tile, ≤7 slots wasted)
+      M=9-16  → TILE_M=16  (1 tile, ≤7 slots wasted)
+      M=17-32 → TILE_M=32  (1 tile, ≤15 slots wasted)
+      M=33-64 → TILE_M=64  (1 tile, ≤31 slots wasted)
+      M=65+   → TILE_M=128 (prefill-optimized)
     """
     VALID_TILE_M = [8, 16, 32, 64, 128]
     
-    best_tile_m = 128
-    best_waste = float('inf')
-    
     for tile_m in VALID_TILE_M:
-        waste = (tile_m - (num_tokens % tile_m)) % tile_m
-        # Prefer smaller tile when waste is equal (less register pressure)
-        if waste < best_waste or (waste == best_waste and tile_m < best_tile_m):
-            best_waste = waste
-            best_tile_m = tile_m
+        if num_tokens <= tile_m:
+            return tile_m
     
-    return best_tile_m
+    return 128  # Fallback for large batches
 
 
 @functools.cache
@@ -329,17 +345,20 @@ After running with different token counts, cache will contain:
 
 ```
 ~/.cache/flashinfer/0.6.0/121a/cached_ops/
-├── fused_moe_120_M8_N128_K128/      # Decode (1-8 tokens)
+├── fused_moe_120_M8_N128_K128/      # M ∈ [1, 8]   - decode
 │   └── fused_moe_120_M8_N128_K128.so
-├── fused_moe_120_M16_N128_K128/     # Decode (9-16 tokens)
+├── fused_moe_120_M16_N128_K128/     # M ∈ [9, 16]  - decode
 │   └── fused_moe_120_M16_N128_K128.so
-├── fused_moe_120_M32_N128_K128/     # Small batch (17-32 tokens)
+├── fused_moe_120_M32_N128_K128/     # M ∈ [17, 32] - small batch
 │   └── fused_moe_120_M32_N128_K128.so
-├── fused_moe_120_M64_N128_K128/     # Medium batch (33-64 tokens)
+├── fused_moe_120_M64_N128_K128/     # M ∈ [33, 64] - medium batch
 │   └── fused_moe_120_M64_N128_K128.so
-└── fused_moe_120_M128_N128_K128/    # Prefill (65+ tokens)
+└── fused_moe_120_M128_N128_K128/    # M ∈ [65, ∞)  - prefill
     └── fused_moe_120_M128_N128_K128.so
 ```
+
+**Thresholding guarantees:** Each M value maps to exactly one tile, and that tile
+covers all tokens in a single CTA (no multi-tile overhead for decode).
 
 ### 7.2 First-Call vs Cached Performance
 
