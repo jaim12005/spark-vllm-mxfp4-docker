@@ -401,14 +401,17 @@ This is **not a gap** compared to TRT-LLM.
 
 ### Next Steps (Priority Order)
 
-| Rank | Task | Expected Gain | Effort | Source |
-|------|------|---------------|--------|--------|
-| **1** | **Port `topkGatingSoftmax` fused kernel for 128 experts** | +1-3 tok/s | Medium | SGLang |
-| **2** | Expand SM12x MoE kernel configs (add 128×8, 128×16 tiles) | +2-4 tok/s | Medium | TRT-LLM |
-| **3** | Implement min_latency_mode for Blackwell | +2-3 tok/s | Medium | TRT-LLM |
-| **4** | Low-M CUDA core for QKV/O (N<128k) | +1-2 tok/s | Medium | TRT-LLM |
-| **5** | Investigate FP4×FP4 `mxf4.block_scale` MoE GEMM | +2-6 tok/s | High | llama.cpp |
-| **6** | Activation quant fusion in MoE GEMM | +5-10% | High | TRT-LLM |
+| Rank | Task | Expected Gain | Effort | Source | Status |
+|------|------|---------------|--------|--------|--------|
+| ~~1~~ | ~~Port `topkGatingSoftmax` fused kernel~~ | ~~+1-3 tok/s~~ | ~~Medium~~ | ~~SGLang~~ | ✅ **Already in vLLM** |
+| **1** | **Expand SM12x MoE kernel configs (add 128×8, 128×16 tiles)** | +2-4 tok/s | Medium | TRT-LLM | **Next** |
+| **2** | Implement min_latency_mode for Blackwell | +2-3 tok/s | Medium | TRT-LLM | Pending |
+| **3** | Low-M CUDA core for QKV/O (N<128k) | +1-2 tok/s | Medium | TRT-LLM | Pending |
+| **4** | Investigate FP4×FP4 `mxf4.block_scale` MoE GEMM | +2-6 tok/s | High | llama.cpp | Pending |
+| **5** | Activation quant fusion in MoE GEMM | +5-10% | High | TRT-LLM | Pending |
+
+**Note:** vLLM already has fused `topkGatingSoftmax` kernel with 128-expert specialization
+(`csrc/moe/topk_softmax_kernels.cu`). This is called via `fused_topk()` in the MoE layer.
 
 **Expected result:** 50.5 → **56-62 tok/s** (exceeds llama.cpp!)
 
@@ -761,14 +764,15 @@ __global__ void build_tree_efficient_partial_packed(
 - ✅ CUDA graphs enabled (+1.5 t/s)
 
 **Next priority (Plain Decode):**
-1. **Port `topkGatingSoftmax`** — Fuse softmax+topk for 128 experts (+1-3 tok/s)
-2. **Expand SM12x MoE kernel configs** — Add small-N tiles (+2-4 tok/s)
+1. ~~Port `topkGatingSoftmax`~~ — ✅ Already in vLLM (`csrc/moe/topk_softmax_kernels.cu`)
+2. **Expand SM12x MoE kernel configs** — Add small-N tiles (+2-4 tok/s) — **NEXT**
 3. **Implement min_latency_mode** — Decode-oriented tile selection (+2-3 tok/s)
+4. **Low-M CUDA core for QKV/O** — N<128k threshold (+1-2 tok/s)
 
 **Projected trajectory (Plain Decode):**
 - Current: **50.5 tok/s**
-- After MoE routing fusion: **52-53 tok/s** (matches SGLang!)
-- After MoE tile tuning: **56-62 tok/s** (exceeds llama.cpp!)
+- After MoE tile tuning: **54-58 tok/s** (exceeds SGLang!)
+- After all optimizations: **56-62 tok/s** (exceeds llama.cpp!)
 
 ## Speculative Decode
 
