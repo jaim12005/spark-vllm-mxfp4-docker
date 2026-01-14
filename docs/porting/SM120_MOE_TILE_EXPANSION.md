@@ -103,7 +103,7 @@ FlashInfer already caches compiled kernels:
 
 ## 4. Reference Implementations
 
-### 4.1 TRT-LLM MXFP4 Configs (SM100)
+### 4.1 TRT-LLM MXFP4 Configs (SM100) - Reference Only
 
 From `trtllmGen_bmm_export/config.json`:
 
@@ -112,8 +112,10 @@ From `trtllmGen_bmm_export/config.json`:
 | `BatchedGemmMxE2m1E4m3LowLatency` | Decode-optimized | Small M-tile | **Decode** |
 | `BatchedGemmMxE2m1MxE4m3HighThroughput` | Prefill-optimized | Large M-tile, cluster | Prefill |
 
-**Note:** TRT-LLM's config format uses different naming. The key insight is they have
-separate configs for decode vs prefill, optimizing the token dimension differently.
+**⚠️ CAUTION:** These are SM100 configs, not SM120. Key differences:
+- SM100 and SM120 have different TMA/vectorization requirements
+- Some tile sizes may not compile or perform poorly on SM120
+- Treat as "worth investigating," not as proven solutions
 
 ### 4.2 Tile Selection Strategies
 
@@ -288,7 +290,16 @@ def select_tile_m_for_moe(
     max_rows_per_expert = rows_per_expert.max().item()
     
     # Threshold to tile size
-    VALID_TILE_M = [8, 16, 32, 64, 128]
+    # NOTE: Start conservative. Smaller tiles (8, 16) may have alignment/
+    # vectorization issues on SM120. Validate each before enabling.
+    #
+    # Priority order for implementation:
+    #   1. 128 - known working (current)
+    #   2. 64, 32 - likely safe, try first
+    #   3. 16 - may require alignment checks  
+    #   4. 8 - experimental, may not work with TMA/vectorized epilogues
+    #
+    VALID_TILE_M = [16, 32, 64, 128]  # Start conservative, add 8 if it works
     for tile_m in VALID_TILE_M:
         if max_rows_per_expert <= tile_m:
             return tile_m
@@ -473,14 +484,15 @@ def prewarm_moe_tiles():
 
 | Max Tokens/Expert | Old TILE_M | New TILE_M | Utilization | Improvement |
 |-------------------|------------|------------|-------------|-------------|
-| 1 (decode) | 128 | 8 | 0.8% → 12.5% | **+15× util** |
-| 2 | 128 | 8 | 1.6% → 25% | **+15× util** |
-| 4 | 128 | 8 | 3.1% → 50% | **+16× util** |
-| 8 | 128 | 8 | 6.3% → 100% | **+16× util** |
-| 16 | 128 | 16 | 12.5% → 100% | **+8× util** |
-| 64 | 128 | 64 | 50% → 100% | **+2× util** |
+| 1-16 (decode) | 128 | 16* | 0.8-12.5% → 6.3-100% | **+8× util** |
+| 17-32 | 128 | 32* | 13-25% → 53-100% | **+4× util** |
+| 33-64 | 128 | 64* | 26-50% → 52-100% | **+2× util** |
+| 65+ | 128 | 128 | 51-100% | (no change) |
+
+*Conservative starting point. Smaller tiles (8) may work but require validation.
 
 **Note:** These are per-expert M values after routing, not total input tokens.
+Actual improvement depends on whether smaller tiles compile and perform well.
 
 ### 8.2 Projected Decode Throughput
 
@@ -494,27 +506,47 @@ def prewarm_moe_tiles():
 
 ## 9. Implementation Steps
 
-### Step 1: Parameterize JIT Template
+### Step 1: Validate Tile Sizes on SM120 (BEFORE coding)
+**Critical:** Not all tile sizes work on SM120. Before implementing:
+1. Check CUTLASS SM120 examples for supported tile shapes
+2. Verify TMA alignment requirements (often 16-element minimum)
+3. Check vectorized epilogue constraints
+4. Compile a test kernel with each proposed tile size
+
+**Recommended validation order:**
+- ✅ 128×128×128 - known working
+- 🔬 64×128×128 - likely safe, test first
+- 🔬 32×128×128 - likely safe
+- ⚠️ 16×128×128 - may need alignment adjustments
+- ⚠️ 8×128×128 - experimental, may fail compilation or vectorization
+
+### Step 2: Parameterize JIT Template
 **File:** `flashinfer/jit/batch_moe_gen.py`
-- Add `tile_m`, `tile_n`, `tile_k` parameters
-- Include in cache key (module name): `fused_moe_120_M{tile_m}_N{tile_n}_K{tile_k}`
+- Add `tile_m` parameter (keep tile_n, tile_k fixed initially)
+- Include in cache key: `fused_moe_120_M{tile_m}_N128_K128`
 
-### Step 2: Add Tile Selection Function
+### Step 3: Add Tile Selection Function
 **File:** `flashinfer/fused_moe/core.py`
-- Add `select_tile_m_for_tokens(num_tokens)` function
-- Returns optimal TILE_M from [8, 16, 32, 64, 128]
+- Add `select_tile_m_for_moe()` function
+- Start with conservative set: [16, 32, 64, 128]
+- Add smaller tiles only after validation
 
-### Step 3: Wire Through get_cutlass_fused_moe_module
+### Step 4: Wire Through get_cutlass_fused_moe_module
 **File:** `flashinfer/fused_moe/core.py`
 - Add `tile_m` parameter
 - Pass to JIT generator
 
-### Step 4: Update C++ Launcher Template
+### Step 5: Update C++ Launcher Template
 **File:** `moe_gemm_sm120_mixed_input_launcher.inl`
-- Use preprocessor defines for tile dimensions: `-DTILE_M=...`
+- Use struct template with -DTILE_M preprocessor define
 - Ensure CUTLASS types work with variable tile shapes
 
-### Step 5: (Optional) Add Pre-warming
+### Step 6: Benchmark Each Tile Size
+- Profile decode latency for each validated tile
+- Smaller tiles may have higher overhead that offsets utilization gains
+- Pick based on measured performance, not theory
+
+### Step 7: (Optional) Add Pre-warming
 **File:** `flashinfer/fused_moe/core.py`
 - Add `prewarm_moe_tiles()` function
 - Call during vLLM server startup
@@ -539,8 +571,11 @@ def prewarm_moe_tiles():
 | Compiler "Error Internal" | Follow existing namespace pattern exactly |
 | First-call JIT latency | Pre-warm during server startup |
 | Cache key collision | Include full tile shape in module name |
-| CUTLASS tile incompatibility | Test each TILE_M value individually |
-| CUTLASS doesn't support small M-tiles | Verify SM120 MMA supports 8×N×K shape |
+| **Small M-tiles don't compile** | Start with 32/64, add smaller tiles incrementally |
+| **TMA alignment violations** | Check SM120 TMA requirements (often 16-element min) |
+| **Vectorized epilogue fails** | May need N≥16; test before assuming N=8 works |
+| **Overhead exceeds savings** | Benchmark each tile; smaller isn't always faster |
+| SM100 configs don't transfer | Don't assume TRT-LLM SM100 tiles work on SM120 |
 
 ---
 
