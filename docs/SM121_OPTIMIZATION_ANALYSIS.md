@@ -75,17 +75,19 @@ topkGatingSoftmax<T, VPT, 128, WARPS_PER_TB, BYTES_PER_LDG><<<...>>>(
 - Fuses softmax → max/argmax → top-k selection → renormalization
 - Eliminates separate kernel launches per operation
 
-**Current vLLM/FlashInfer:** Separate softmax and top-k operations
+**Current vLLM/FlashInfer:** ✅ **Already has fused kernel** (`csrc/moe/topk_softmax_kernels.cu`)
+- vLLM's `topkGatingSoftmax` kernel is the same optimization
+- Called via `fused_topk()` → `ops.topk_softmax()` in MoE layer
+- Template-specialized for 128 experts (gpt-oss's expert count)
 
-**Expected Impact:** +1-3 tok/s (eliminates per-layer kernel launch overhead × 36 layers)
-**Effort:** Medium (port kernel from SGLang's `sgl-kernel/csrc/moe/moe_topk_softmax_kernels.cu`)
+**Status:** ✅ Already implemented — no porting needed
 
 ### SGLang feature applicability matrix (Plain Decode)
 
 | SGLang Feature | Applies? | Why |
 |----------------|----------|-----|
 | `moe_fused_gate` (biased grouped topk) | ❌ | gpt-oss uses softmax, not sigmoid + bias |
-| `topkGatingSoftmax` (fused softmax+topk) | ✅ | 128 experts = power of 2 |
+| `topkGatingSoftmax` (fused softmax+topk) | ✅ Already in vLLM | vLLM has same kernel (`csrc/moe/topk_softmax_kernels.cu`) |
 | Two-Batch Overlap (TBO) | ❌ | No expert parallel on single GPU |
 | Single-Batch Overlap (SBO) | ❌ | No shared experts in gpt-oss |
 | DeepGEMM SM partitioning | ❌ | SM90/SM100 only |
@@ -105,7 +107,7 @@ topkGatingSoftmax<T, VPT, 128, WARPS_PER_TB, BYTES_PER_LDG><<<...>>>(
 | **2** | MoE GEMM tile+stage tuning | ✅ (many variants) | ⚠️ | ⚠️ (128×128 only) | **+5-10%** | Medium |
 | **3** | Activation quant fusion in MoE GEMM | ✅ (SM100 only) | ❌ | ❌ (separate kernel) | **+5-10%** | High |
 | **4** | MoE GEMM decode tile configs | ✅ | ⚠️ | ❌ (not for Blackwell) | **+3-5%** | Medium |
-| **5** | **Fused MoE routing (softmax→topk)** | ✅ | ✅ (`topkGatingSoftmax`) | ❌ | **+2-4%** | Medium |
+| **5** | **Fused MoE routing (softmax→topk)** | ✅ | ✅ (`topkGatingSoftmax`) | ✅ (same kernel) | N/A | Done |
 | **6** | Low-M CUDA core dispatch for dense | ✅ (M≤4, N≤128k) | ⚠️ | ❌ | **+2-3%** | Medium |
 | **7** | Native FP4 dense GEMM (FP8×FP4) | ✅ | ❌ | ❌ (Marlin dequant) | +2-5% | High |
 | **8** | Fused QKV projection | ✅ | ✅ | ✅ | +1-2% | Done |
