@@ -1,6 +1,12 @@
 # SM120 MoE Tile Expansion Plan
 
-## Problem
+## Approach: Dynamic Tile Selection (Option B)
+
+Following llama.cpp's proven approach: precompile multiple tile variants, select best at runtime.
+
+---
+
+## 1. Problem Statement
 
 The FlashInfer SM120 MoE GEMM launcher currently has a **single fixed tile configuration**:
 
@@ -11,85 +17,149 @@ namespace sm120_mxfp4_bf16_128x128x128 {
 }
 ```
 
-This is suboptimal for decode (batch_size=1-2) where M is very small. Larger tiles have:
-- More wasted compute (padding M up to 128 when M=1-4)
-- More shared memory usage than needed
-- Higher latency (larger tiles take longer to complete)
+### Why This Is Suboptimal for Decode
 
-## Reference: TRT-LLM MXFP4 Configs (SM100)
+| M | Current Tile | Utilization | Padding Waste |
+|---|--------------|-------------|---------------|
+| 1 | 128×128×128 | 0.8% | 127 rows wasted |
+| 2 | 128×128×128 | 1.6% | 126 rows wasted |
+| 4 | 128×128×128 | 3.1% | 124 rows wasted |
+| 8 | 128×128×128 | 6.3% | 120 rows wasted |
+
+---
+
+## 2. Reference Implementations
+
+### 2.1 TRT-LLM MXFP4 Configs (SM100)
 
 From `trtllmGen_bmm_export/config.json`:
 
-| Template | mmaM | tileN | tileK | mmaK | Cluster | Use Case |
-|----------|------|-------|-------|------|---------|----------|
-| `BatchedGemmMxE2m1E4m3LowLatency` | 128 | **8** | 512 | 32 | 1 | **Decode** |
-| `BatchedGemmMxE2m1MxE4m3LowLatency` | 128 | **8** | 512 | 32 | 1 | **Decode** |
-| `BatchedGemmMxE2m1MxE4m3HighThroughput` | **256** | 8 | 512 | 32 | **2** | Prefill |
-| `BatchedGemmMxE2m1Bf16LowLatency` | 128 | 8 | 256 | 16 | 1 | BF16 path |
+| Template | mmaM | tileN | tileK | Cluster | Use Case |
+|----------|------|-------|-------|---------|----------|
+| `BatchedGemmMxE2m1E4m3LowLatency` | 128 | **8** | 512 | 1 | **Decode** |
+| `BatchedGemmMxE2m1MxE4m3HighThroughput` | **256** | 8 | 512 | **2** | Prefill |
 
-**Key observations:**
-- TRT-LLM uses **tileN=8** for decode (smaller than CUTLASS example's 16)
-- tileK=512 for FP4/FP8 paths
-- Scale factor layout: "8x4" (sfLayoutB/sfLayoutC)
+**Key insight:** TRT-LLM uses **tileN=8** for decode, not 16 or 128.
 
-## Reference: llama.cpp Dynamic Tile Selection
+### 2.2 llama.cpp Dynamic Selection
 
-llama.cpp uses **runtime tile selection** instead of hardcoded tiles:
+llama.cpp's approach that achieves 58 tok/s:
 
 ```cpp
-// Precompile 16 variants: 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128
+// Precompile 16 variants: 8, 16, 24, 32, ..., 128
 for (int mmq_x = 8; mmq_x <= mmq_x_max; mmq_x += 8) {
     if (mmq_x % granularity != 0 || shared_mem > smpbo) continue;
     const int ntiles_x = (ncols_max + mmq_x - 1) / mmq_x;
     if (ntiles_x < ntiles_x_best) {
-        mmq_x_best = mmq_x;  // Pick tile minimizing waste
+        mmq_x_best = mmq_x;  // Minimize padding waste
     }
 }
-switch (mmq_x_best) { ... }  // Dispatch to precompiled kernel
+switch (mmq_x_best) { /* dispatch to precompiled kernel */ }
 ```
 
-**Plus dynamic warp count** (`calc_nwarps`):
+**Plus dynamic warp tuning:**
 ```cpp
 switch (ncols_dst) {
-    case 1..4: return 4;  // More warps for small problems
+    case 1..4: return 4;  // More warps for tiny problems
     case 5..8: return 2;
     default:   return 1;
 }
 ```
 
-## Current Performance
+---
 
-| M | Current Tile | Utilization | Latency |
-|---|--------------|-------------|---------|
-| 1 | 128×128×128 | 0.8% | High |
-| 2 | 128×128×128 | 1.6% | High |
-| 4 | 128×128×128 | 3.1% | High |
-| 8 | 128×128×128 | 6.3% | High |
+## 3. FlashInfer Autotuner Evaluation
 
-## Proposed Solution
+### 3.1 Current Autotuner Architecture
 
-Add decode-oriented tile configurations following TRT-LLM/llama.cpp approaches:
+FlashInfer has a sophisticated autotuner (`flashinfer/autotuner.py`):
 
-### New Tile Configurations
+```python
+class AutoTuner:
+    def choose_one(self, custom_op, runners, tuning_config, inputs):
+        """Profile all tactics, return best (runner, tactic) pair."""
+        for tac in valid_tactics:
+            time = self._profile_single_kernel(runner, inputs, tac)
+            if time < min_time:
+                best_tactic = tac
+        # Cache result
+        self.profiling_cache[cache_key] = (runner_id, tactic)
+```
 
-Following TRT-LLM's configs (tileN=8 for decode, tileK=512):
+**Tuning config supports:**
+- Dynamic tensor dimensions (DynamicTensorSpec)
+- Bucket-based profiling (powers of 2)
+- Constraint specifications
+- Cached results per GPU model
+
+### 3.2 What's Disabled/Missing for SM120
+
+| Feature | SM100 (TRT-LLM) | SM120 (Current) | Benefit if Enabled |
+|---------|-----------------|-----------------|-------------------|
+| **Multiple tile configs** | ✅ Many tiles | ❌ Only 128×128×128 | **+2-4 tok/s** |
+| **Mainloop schedule tuning** | ✅ AUTO/PINGPONG/COOP | ❌ Fixed | +1-2 tok/s |
+| **Cluster shape tuning** | ✅ 1×1, 2×1, etc. | ❌ Fixed 1×1×1 | +5-10% prefill |
+| **min_latency_mode** | ✅ Decode optimization | ❌ Not wired | +2-4 tok/s |
+| **Stage count tuning** | ✅ AUTO picks stages | ❌ Fixed AUTO | +5-15% |
+
+### 3.3 Tile Configs Defined But Not Implemented
+
+The `CutlassTileConfigSM120` enum has 6 configs, but only 1 is implemented:
 
 ```cpp
-// Decode tile: 128×8×512 (matches TRT-LLM BatchedGemmMxE2m1E4m3LowLatency)
-namespace sm120_mxfp4_bf16_128x8x512 {
-    using TileShape_MNK = Shape<_128, _8, _512>;
+enum class CutlassTileConfigSM120 {
+    Undefined,
+    ChooseWithHeuristic,
+    CtaShape128x128x128B,  // ✅ IMPLEMENTED
+    CtaShape128x128x64B,   // ❌ Not implemented
+    CtaShape256x128x64B,   // ❌ Not implemented
+    CtaShape128x256x64B,   // ❌ Not implemented
+    CtaShape128x128x256B,  // ❌ Not implemented
+    CtaShape256x128x128B,  // ❌ Not implemented
+};
+```
+
+The dispatcher falls back to 128×128×128:
+```cpp
+switch (gemmConfig.tile_config_sm120) {
+    case CtaShape128x128x128B: /* dispatch */ break;
+    default:
+        // Falls back to 128×128×128 for anything else!
+}
+```
+
+### 3.4 Recommendation: Enable Autotuner for SM120
+
+**Phase 1: Tile Expansion (this document)**
+- Implement multiple tile variants (8, 16, 32, 64, 128)
+- Add dynamic dispatch based on M
+
+**Phase 2: Integrate with Autotuner**
+- Expose tile configs as tactics
+- Let autotuner profile and cache best configs per (M, K, N, expert_count)
+
+---
+
+## 4. Implementation Plan (Dynamic Dispatch)
+
+### 4.1 New Tile Configurations
+
+Following TRT-LLM's decode configs:
+
+```cpp
+// Priority tiles for decode
+namespace sm120_mxfp4_bf16_128x8x128 {
+    using TileShape_MNK = Shape<_128, _8, _128>;
     using ClusterShape_MNK = Shape<_1, _1, _1>;
-    // sfLayoutB = "8x4" for block scales
 }
 
-// Intermediate tiles for gradual scaling
-namespace sm120_mxfp4_bf16_128x16x256 {
-    using TileShape_MNK = Shape<_128, _16, _256>;
+namespace sm120_mxfp4_bf16_128x16x128 {
+    using TileShape_MNK = Shape<_128, _16, _128>;
     using ClusterShape_MNK = Shape<_1, _1, _1>;
 }
 
-namespace sm120_mxfp4_bf16_128x32x256 {
-    using TileShape_MNK = Shape<_128, _32, _256>;
+namespace sm120_mxfp4_bf16_128x32x128 {
+    using TileShape_MNK = Shape<_128, _32, _128>;
     using ClusterShape_MNK = Shape<_1, _1, _1>;
 }
 
@@ -98,188 +168,158 @@ namespace sm120_mxfp4_bf16_128x64x128 {
     using ClusterShape_MNK = Shape<_1, _1, _1>;
 }
 
-// High-throughput prefill tile (matches TRT-LLM HighThroughput)
-namespace sm120_mxfp4_bf16_256x8x512 {
-    using TileShape_MNK = Shape<_256, _8, _512>;
-    using ClusterShape_MNK = Shape<_2, _1, _1>;  // 2x cluster for throughput
+// Existing (for prefill/fallback)
+namespace sm120_mxfp4_bf16_128x128x128 {
+    using TileShape_MNK = Shape<_128, _128, _128>;
+    using ClusterShape_MNK = Shape<_1, _1, _1>;
 }
 ```
 
-### Option A: Static Threshold Dispatch (Simple)
+### 4.2 Dynamic Dispatch Logic
 
 ```cpp
-// Select tile based on M (number of tokens)
-TileConfig selectTileForDecode(int M, bool min_latency_mode) {
-    if (min_latency_mode && M <= 8) {
-        return TileConfig::_128x8x512;   // Decode
-    } else if (min_latency_mode && M <= 32) {
-        return TileConfig::_128x32x256;
-    } else if (M > 256) {
-        return TileConfig::_256x8x512;   // Prefill (high throughput)
-    } else {
-        return TileConfig::_128x128x128; // Default
-    }
-}
-```
-
-### Option B: Dynamic Selection (llama.cpp-style)
-
-Precompile multiple tiles, select best at runtime:
-
-```cpp
-// Precompile: 8, 16, 32, 64, 128 tiles
-template <int TileN>
-void launch_moe_gemm(...);
-
-void dispatch_moe_gemm(int M, int N, int K, ...) {
-    const int tile_options[] = {8, 16, 32, 64, 128};
+// Runtime tile selection (llama.cpp-style)
+template <typename T, typename WeightType, typename OutputType>
+void sm120_moe_gemm_dispatch(
+    TmaWarpSpecializedGroupedGemmInput tma_inputs,
+    int num_experts,
+    int M,  // Number of tokens (extracted from problem shape)
+    cudaStream_t stream)
+{
+    // Select tile that minimizes padding waste
+    constexpr int tile_options[] = {8, 16, 32, 64, 128};
     int best_tile = 128;
     int best_waste = INT_MAX;
     
     for (int tile : tile_options) {
-        if (smem_for_tile(tile) > max_smem) continue;
-        int waste = (tile - (M % tile)) % tile;  // Padding waste
-        if (waste < best_waste) {
+        // Check shared memory fits
+        size_t smem = smem_for_tile(tile);
+        if (smem > max_smem_per_sm) continue;
+        
+        // Calculate padding waste
+        int waste = (tile - (M % tile)) % tile;
+        if (waste < best_waste || (waste == best_waste && tile < best_tile)) {
             best_waste = waste;
             best_tile = tile;
         }
     }
     
+    // Dispatch to precompiled kernel
     switch (best_tile) {
-        case   8: launch_moe_gemm<  8>(...); break;
-        case  16: launch_moe_gemm< 16>(...); break;
-        case  32: launch_moe_gemm< 32>(...); break;
-        case  64: launch_moe_gemm< 64>(...); break;
-        case 128: launch_moe_gemm<128>(...); break;
+        case   8: launch_sm120_moe<8>(...);   break;
+        case  16: launch_sm120_moe<16>(...);  break;
+        case  32: launch_sm120_moe<32>(...);  break;
+        case  64: launch_sm120_moe<64>(...);  break;
+        case 128: launch_sm120_moe<128>(...); break;
     }
 }
 ```
 
-**Pros of Option B:**
-- No hardcoded thresholds
-- Automatically adapts to different batch sizes
-- Same approach proven in llama.cpp (58 tok/s!)
+### 4.3 Python API Changes
 
-**Cons:**
-- More kernels to compile (JIT cache larger)
-- Slightly more complex launcher
-
-## Expected Impact
-
-| M | New Tile | Utilization | Est. Speedup |
-|---|----------|-------------|--------------|
-| 1 | 128×8×128 | 12.5% | +15× util |
-| 2 | 128×8×128 | 25% | +15× util |
-| 4 | 128×8×128 | 50% | +16× util |
-| 8 | 128×8×128 | 100% | +16× util |
-
-Projected decode improvement: **+2-4 tok/s** (3-8% improvement)
-
-## Implementation Steps
-
-### Step 1: Add New Tile Namespaces
-
-File: `flashinfer/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_sm120_mixed_input_launcher.inl`
-
-1. Duplicate the `sm120_mxfp4_bf16_128x128x128` namespace for each new tile size
-2. Update `TileShape_MNK` in each namespace
-
-### Step 2: Add Tile Dispatch Function
-
-```cpp
-template <typename T, typename WeightType, typename OutputType, typename EpilogueTag>
-void sm120_mixed_input_moe_gemm_dispatch(
-    TmaWarpSpecializedGroupedGemmInput tma_inputs, 
-    int num_experts,
-    int multi_processor_count, 
-    cudaStream_t stream, 
-    int* occupancy,
-    size_t* workspace_size,
-    bool min_latency_mode) {
-    
-    // Get M from problem shape
-    int M = tma_inputs.get_m();
-    
-    if (min_latency_mode && M <= 8) {
-        // Use 128×8 tile for decode
-        sm120_mixed_input_moe_gemm_kernelLauncher<
-            T, WeightType, OutputType, EpilogueTag,
-            Shape<_128, _8, _128>, Shape<_1, _1, _1>, true>(...);
-    } else if (min_latency_mode && M <= 16) {
-        // Use 128×16 tile
-        sm120_mixed_input_moe_gemm_kernelLauncher<...>();
-    } else {
-        // Default: 128×128 for prefill
-        sm120_mixed_input_moe_gemm_kernelLauncher<
-            T, WeightType, OutputType, EpilogueTag,
-            Shape<_128, _128, _128>, Shape<_1, _1, _1>, true>(...);
-    }
-}
-```
-
-### Step 3: Expose min_latency_mode in Python API
-
-File: `flashinfer/fused_moe/core.py`
-
-Add parameter to `cutlass_fused_moe()`:
 ```python
+# flashinfer/fused_moe/core.py
 def cutlass_fused_moe(
     input: torch.Tensor,
-    ...
-    min_latency_mode: bool = False,  # NEW: Use decode-optimized tiles
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    # NEW: Enable decode-optimized tile selection
+    auto_tile_select: bool = True,  # Dynamic dispatch (Option B)
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
 ```
 
-### Step 4: Wire Through vLLM
+### 4.4 vLLM Integration
 
-File: `vllm/model_executor/layers/fused_moe/flashinfer_cutlass_moe.py`
-
-Set `min_latency_mode=True` during decode when M is small.
-
-## Validation Plan
-
-1. **Compile test**: Verify all new tile namespaces compile without "Error Internal"
-2. **Correctness test**: Compare output against 128×128 baseline
-3. **Performance test**: Benchmark all tiles across M=1,2,4,8,16,32,64,128
-4. **Integration test**: Run full vLLM decode benchmark
-
-## CUTLASS Validation
-
-CUTLASS Blackwell MoE examples **already use small-N tiles** for decode:
-
-```cpp
-// From cutlass/examples/92_blackwell_moe_gemm/92_blackwell_moe_gemm_grouped.cu
-using MmaTileMNK = Shape<_128,_16,Int<128 / sizeof(ElementA)>>;
-// Comment: "use tile size of N=16 to match real use cases 
-// (N is typically very small in decoding stage)"
+```python
+# vllm/model_executor/layers/fused_moe/flashinfer_cutlass_moe.py
+_ = flashinfer_cutlass_fused_moe(
+    input=hidden_states,
+    token_selected_experts=topk_ids.to(torch.int),
+    token_final_scales=topk_weights,
+    fc1_expert_weights=fc1_weights,
+    fc2_expert_weights=fc2_weights,
+    output_dtype=self.out_dtype,
+    auto_tile_select=True,  # Enable dynamic tile selection
+    activation_type=activation_type,
+)
 ```
 
-This confirms CUTLASS supports 128×16 tiles for SM120 block-scaled MMA.
+---
 
-## Risks and Mitigations
+## 5. Expected Performance Impact
+
+### 5.1 Tile Utilization Improvement
+
+| M | Old Tile | New Tile | Utilization | Improvement |
+|---|----------|----------|-------------|-------------|
+| 1 | 128×128 | 128×8 | 0.8% → 12.5% | **+15× util** |
+| 2 | 128×128 | 128×8 | 1.6% → 25% | **+15× util** |
+| 4 | 128×128 | 128×8 | 3.1% → 50% | **+16× util** |
+| 8 | 128×128 | 128×8 | 6.3% → 100% | **+16× util** |
+
+### 5.2 Projected Decode Throughput
+
+| Configuration | Decode (tok/s) | Notes |
+|---------------|----------------|-------|
+| Current (128×128 only) | ~50 | Baseline |
+| After tile expansion | **52-56** | +4-12% |
+| + mainloop tuning | **54-58** | +8-16% |
+
+---
+
+## 6. Implementation Steps
+
+### Step 1: Add Tile Namespaces
+**File:** `moe_gemm_sm120_mixed_input_launcher.inl`
+- Duplicate the existing namespace for each new tile size
+- Follow the exact pattern to avoid "Error Internal" compiler bug
+
+### Step 2: Add Dispatch Function
+**File:** `moe_gemm_sm120_mixed_input_launcher.h`
+- Add `sm120_moe_gemm_dispatch()` with tile selection logic
+- Wire through to Python bindings
+
+### Step 3: Update Python API
+**File:** `flashinfer/fused_moe/core.py`
+- Add `auto_tile_select` parameter
+- Pass to C++ launcher
+
+### Step 4: Integrate with Autotuner (Future)
+**File:** `flashinfer/autotuner.py`
+- Expose tiles as tactics
+- Let autotuner profile and cache
+
+---
+
+## 7. Validation Plan
+
+1. **Compile test**: All 5 tile variants build without errors
+2. **Correctness test**: Output matches reference for each tile
+3. **Performance test**: Profile each tile for M=1,2,4,8,16,32,64,128
+4. **Integration test**: Full vLLM decode benchmark
+5. **Regression test**: Ensure prefill performance maintained
+
+---
+
+## 8. Risks and Mitigations
 
 | Risk | Mitigation |
 |------|------------|
-| Compiler "Error Internal" on new tiles | Follow same namespace pattern as 128×128 |
-| ~~CUTLASS doesn't support small-N tiles~~ | ✅ CUTLASS examples use 128×16 for decode |
-| Shared memory constraints | Reduce stage count for smaller tiles |
-| JIT cache explosion (multiple tile variants) | Cache key includes tile config |
+| Compiler "Error Internal" | Follow existing namespace pattern exactly |
+| JIT cache explosion | 5 tiles × 2 dtypes = 10 kernels (acceptable) |
+| Shared memory overflow | Check SMEM before dispatch, fallback to smaller tile |
+| Performance regression | Benchmark each tile variant before merge |
 
-## Alternative: Stage Tuning Only
+---
 
-If small tiles aren't supported by CUTLASS block-scaled MMA, we can alternatively tune **stages** for the existing 128×128 tile:
+## 9. References
 
-```cpp
-// More stages = better latency hiding for small M
-namespace sm120_mxfp4_bf16_128x128x128_stages6 {
-    using StageCount = Int<6>;  // Instead of Auto
-}
-```
-
-This is less impactful but may still provide +1-2 tok/s.
-
-## References
-
-- TRT-LLM tile configs: `trtllmGen_bmm_export/config.json`
-- CUTLASS SM120 tests: `cutlass/test/unit/gemm/device/sm120_tensorop_gemm/`
-- FlashInfer current launcher: `moe_gemm_sm120_mixed_input_launcher.inl`
+- **TRT-LLM tile configs:** `trtllmGen_bmm_export/config.json`
+- **llama.cpp dynamic dispatch:** `ggml-cuda/mmq.cuh:3980-4048`
+- **CUTLASS SM120 examples:** `cutlass/examples/92_blackwell_moe_gemm/`
+- **FlashInfer autotuner:** `flashinfer/autotuner.py`
+- **Current launcher:** `moe_gemm_sm120_mixed_input_launcher.inl`
