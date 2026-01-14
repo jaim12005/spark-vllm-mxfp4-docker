@@ -379,7 +379,7 @@ def cutlass_fused_moe(
 **File:** `moe_gemm_sm120_mixed_input_launcher.inl`
 
 ```cpp
-// Template parameterized by tile shape (JIT provides values via -D flags)
+// Tile config injected via -D flags from JIT
 #ifndef TILE_M
 #define TILE_M 128  // Default
 #endif
@@ -390,18 +390,23 @@ def cutlass_fused_moe(
 #define TILE_K 128
 #endif
 
-namespace sm120_mxfp4_tile {
+// Struct template for tile configuration (namespaces can't be templated)
+template <int TM, int TN, int TK>
+struct Sm120MxFP4TileConfig {
+    using TileShape_MNK = cute::Shape<
+        cute::Int<TM>,  // Token dimension (variable for decode)
+        cute::Int<TN>,  // Output dimension
+        cute::Int<TK>   // Reduction dimension
+    >;
+    using ClusterShape_MNK = cute::Shape<cute::_1, cute::_1, cute::_1>;
+};
 
-using TileShape_MNK = cute::Shape<
-    cute::Int<TILE_M>,  // Token dimension (variable for decode)
-    cute::Int<TILE_N>,  // Output dimension
-    cute::Int<TILE_K>   // Reduction dimension
->;
-using ClusterShape_MNK = cute::Shape<cute::_1, cute::_1, cute::_1>;
+// Instantiate with JIT-provided tile sizes
+using CurrentTileConfig = Sm120MxFP4TileConfig<TILE_M, TILE_N, TILE_K>;
+using TileShape_MNK = CurrentTileConfig::TileShape_MNK;
+using ClusterShape_MNK = CurrentTileConfig::ClusterShape_MNK;
 
-// ... rest of CUTLASS setup ...
-
-}  // namespace sm120_mxfp4_tile
+// ... rest of CUTLASS kernel setup uses TileShape_MNK, ClusterShape_MNK ...
 ```
 
 ---
