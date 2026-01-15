@@ -570,7 +570,7 @@ vllm serve ... --attention-config '{"backend": "FLASHINFER"}'
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `FLASHINFER_CUDA_ARCH_LIST` | `12.1a` | Target SM121 with FP4 hardware path |
+| `FLASHINFER_CUDA_ARCH_LIST` | `12.1f` | Target SM121 with FP4 hardware path (family mode) |
 | `FLASHINFER_NVCC_THREADS` | `4` | Parallel JIT compilation threads |
 | `FLASHINFER_LOGLEVEL` | `0-5` | Logging verbosity (0=quiet) |
 | `FLASHINFER_JIT_VERBOSE` | `0/1` | JIT compilation logging |

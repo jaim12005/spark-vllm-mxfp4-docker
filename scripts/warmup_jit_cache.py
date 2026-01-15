@@ -19,7 +19,7 @@ sys.path.insert(0, "/workspace/flashinfer")
 sys.path.insert(0, "/workspace/vllm")
 
 # Set architecture for JIT
-os.environ["FLASHINFER_CUDA_ARCH_LIST"] = "12.1a"
+os.environ["FLASHINFER_CUDA_ARCH_LIST"] = "12.1f"
 
 import torch
 

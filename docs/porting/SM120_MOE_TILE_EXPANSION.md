@@ -1188,103 +1188,135 @@ With `swap_ab=True`, logical (M, N) becomes physical (N, M). This enables:
 
 ---
 
-## 18. FP4 Shared Memory Optimization (CUTLASS Patch Applied)
+## 18. FP4 Shared Memory: Why uint8 Layout is Correct (Not a Bug)
 
-> **✅ FIXED (2026-01-15):** Applied patch to CUTLASS SM120 block-scaled builders to correctly
-> allocate shared memory for FP4 weights. This enables +1 pipeline stage for most tile configs.
+> **⚠️ INVESTIGATION RESOLVED (2026-01-15):** The uint8 shared memory layout for FP4 weights
+> is **not** a bug - it's required by hardware. See section 19 for full explanation.
 
-### 18.1 Original Bug
+### 18.1 Initial Hypothesis (Incorrect)
 
-For MXFP4 (FP8 activations × FP4 weights), the B tensor shared memory was allocated as if each
-FP4 element occupies 1 byte (8 bits), when it should only occupy 0.5 bytes (4 bits).
+We initially believed that FP4 shared memory was "over-allocated" by 2×:
+- Expected: 8,192 bytes for 16,384 FP4 elements (0.5 bytes each)
+- Actual: 16,384 bytes (uint8 layout, 1 byte each)
 
-| Tile (128, 128, 128) | Before Fix | After Fix | Improvement |
-|---------------------|------------|-----------|-------------|
-| B tensor smem | 16,384 bytes | 8,192 bytes | 50% reduction |
-| Per-stage total | ~33 KB | ~25 KB | -8 KB |
-| Pipeline stages | 3 | 4 | +1 stage |
+This appeared to be a bug that could be fixed to gain +1 pipeline stage.
 
-### 18.2 Root Cause
+### 18.2 Investigation: Attempted Optimizations
 
-In `sm120_blockscaled_mma_builder.inl`, `SmemAllocTypeB` was set to `uint8_t` for all uses:
-- SmemLayoutAtomB (layout sizing)
-- SmemCopyAtomB (copy operations)
-- ArrayEngine allocation
-- Stage calculation
+Several approaches were tried to reduce SMEM usage:
 
-But these have different requirements:
-- **Layout/Allocation**: Should use FP4 for correct sizing (4 bits per element)
-- **Copy Atom**: Must use uint8 for `SM100_SU4_DU8` instruction compatibility
+1. **Separate SmemLayoutTypeB (FP4) vs SmemCopyTypeB (uint8)**
+   - Result: Compilation succeeded, but "illegal instruction" at runtime
+   - Cause: Layout strides in 4-bit units, but ldmatrix expects byte addresses
 
-### 18.3 The Fix
+2. **Use FP4 as Copy_Atom ValType**
+   - Result: Compilation failed
+   - Cause: `TiledCopy uses too few vals for selected CopyAtom`
+   - The MMA's ValTypeB is uint8, creating layout incompatibility
 
-Introduced separate types for different purposes:
+3. **recast<uint8_t>(sB) before partition_S**
+   - Result: Compilation failed
+   - Cause: Halves element count, breaks `size<2>(tCsA) == size<2>(tCsB)` assertion
+
+### 18.3 Root Cause: Hardware Padding Requirement
+
+The `.b4x16_p64` suffix in `ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64` means:
+- **16 × 4-bit values + 64 bits padding = 128 bits = 16 bytes per chunk**
+- So 16 FP4 values (8 bytes payload) require **16 bytes of SMEM**
+
+This is a **hardware contract**. NVIDIA's Blackwell documentation states:
+> "For `.kind::f8f6f4`, SMEM is stored in a 16B-aligned padded format...
+> allocate SMEM as if sub-byte operands were byte operands.
+> Fully compressed contiguous data in SMEM is not supported."
+
+### 18.4 Correct Implementation
+
+The uint8 layout is correct and matches SM100:
 
 ```cpp
 // sm120_blockscaled_mma_builder.inl
-using SmemCopyTypeB = cute::conditional_t<UseMxf8f6f4, uint8_t, ...>;    // For copy atom
-using SmemLayoutTypeB = cute::conditional_t<UseMxf8f6f4, ElementB, ...>; // For layout
-
-// SmemLayoutAtomB uses FP4 type for correct element count
-using SmemLayoutAtomB = sm120_rr_smem_selector<SmemLayoutTypeB, K>();
-
-// SmemCopyAtomB uses uint8 for SU4_DU8 compatibility  
-using SmemCopyAtomB = Copy_Atom<..., SmemCopyTypeB>;
-
-// Stage calculation uses FP4 bit width
-static constexpr int PipelineStages = sm100_compute_stage_count_or_override_blockscaled<
-    ..., SmemAllocTypeA, SmemLayoutTypeB, ...>();
+using SmemAllocTypeB = cute::conditional_t<UseMxf8f6f4, uint8_t, ...>;
+using SmemLayoutTypeB = cute::conditional_t<UseMxf8f6f4, uint8_t, ...>;
+using SmemCopyTypeB = cute::conditional_t<UseMxf8f6f4, uint8_t, ...>;
 ```
-
-And in mainloop files (`sm120_blockscaled_mma_tma.hpp`, `sm120_blockscaled_mma_array_tma.hpp`):
-
-```cpp
-// ArrayEngine uses ElementB (FP4) so array_subbyte packs 2 per byte
-using SmemAllocTypeB = cute::conditional_t<IsF8F6F4, ElementB, ...>;
-alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
-```
-
-### 18.4 Files Modified
-
-1. `cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl`
-2. `cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp`
-3. `cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp`
 
 ### 18.5 Verified Tile Configurations
 
-All tiles compile after the fix:
+All these tiles work correctly with the uint8 layout:
 
 **Native (M >= 64):**
-- M=64: (64, 8), (64, 16), (64, 32), (64, 64), (64, 128), (64, 256)
-- M=128: (128, 8), (128, 16), (128, 32), (128, 64), (128, 128), **(128, 256) NEW**
-- M=256: (256, 8), (256, 16), (256, 32), (256, 64), **(256, 128) NEW**
+- M=64: (64, 8), (64, 16), (64, 32), (64, 64), (64, 128)
+- M=128: (128, 8), (128, 16), (128, 32), (128, 64), (128, 128)
+- M=256: (256, 8), (256, 16), (256, 32), (256, 64)
 
 **Swapped (logical M < 64):**
-- Logical M=8: (8, 64), (8, 128), **(8, 256) NEW**
-- Logical M=16: (16, 64), (16, 128), **(16, 256) NEW**
-- Logical M=32: (32, 64), (32, 128), **(32, 256) NEW**
+- Logical M=8: (8, 64), (8, 128)
+- Logical M=16: (16, 64), (16, 128)
+- Logical M=32: (32, 64), (32, 128)
 
-**Total: 26 tiles (17 native + 9 swapped)**
+### 18.6 Lesson Learned
 
-### 18.6 New Tiles Enabled
-
-The FP4 smem optimization enables 5 new tile configurations:
-- **(128, 256)**: Large prefill with wide N
-- **(256, 128)**: Very large prefill batches
-- **(8, 256), (16, 256), (32, 256)**: Small decode with wide intermediate
-
-### 18.7 Performance Impact
-
-The extra pipeline stage improves latency hiding, particularly beneficial for:
-- Memory-bound workloads
-- Smaller batch sizes where each stage matters more
-- Enabling larger tiles that previously exceeded smem capacity
+The "2× overhead" in SMEM is **mandated by hardware**, not a fixable inefficiency.
+When working with sub-byte types on Blackwell, always check:
+1. Which ldmatrix variant is being used
+2. Whether it has padding requirements (e.g., `_p64`)
+3. The PTX documentation for format requirements
 
 ---
 
-## 19. References
+## 19. FP4 Shared Memory: Hardware Padding Requirement (`.b4x16_p64`)
 
-### 19.1 Internal
+### 19.1 The Constraint
+
+When using the `ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64` instruction for FP4→FP8 expansion, **the shared memory must use padded format**:
+
+- **`.b4x16_p64`** = 16 × 4-bit values + 64 bits padding = 128 bits = 16 bytes
+- So 16 FP4 values (8 bytes of payload) require **16 bytes of SMEM**
+
+This is a **hardware contract**, not a software inefficiency. NVIDIA's Blackwell sub-byte documentation states:
+> "For `.kind::f8f6f4`, SMEM is stored in a 16B-aligned padded format... allocate SMEM as if sub-byte operands were byte operands. Fully compressed contiguous data in SMEM is not supported."
+
+### 19.2 Why uint8 Layout is Correct
+
+Both `SmemLayoutTypeB` and `SmemAllocTypeB` must use `uint8_t` because:
+
+1. The `_p64` suffix means 64 bits of padding per 16×4-bit chunk
+2. The ldmatrix instruction expects byte-aligned addresses (not 4-bit)
+3. CuTe's swizzle/layout operates in byte units, not sub-byte
+
+The "extra" bytes are **required padding**, not waste.
+
+### 19.3 Attempted Optimizations (Why They Failed)
+
+Several approaches were tried to reduce SMEM usage:
+
+1. **FP4 Layout + uint8 Copy Atom**: Causes address mismatch (4-bit vs 8-bit strides)
+2. **FP4 as Copy Atom ValType**: Incompatible with MMA's ValTypeB (uint8)
+3. **recast<uint8_t>(sB)**: Halves element count, breaks CUTLASS assertions
+
+All fail because they violate the hardware's padded format requirement.
+
+### 19.4 Correct Implementation
+
+The SM100-compatible approach (uint8 for everything):
+
+```cpp
+// sm120_blockscaled_mma_builder.inl
+using SmemAllocTypeB = cute::conditional_t<UseMxf8f6f4, uint8_t, ...>;
+using SmemLayoutTypeB = cute::conditional_t<UseMxf8f6f4, uint8_t, ...>;
+using SmemCopyTypeB = cute::conditional_t<UseMxf8f6f4, uint8_t, ...>;
+```
+
+This allocates 2× the FP4 payload size in SMEM, but:
+- TMA writes only the actual FP4 bytes
+- ldmatrix reads from correctly-aligned addresses
+- The "extra" space is the mandated padding
+
+---
+
+## 20. References
+
+### 20.1 Internal
 - **FlashInfer GEMM layout:** `csrc/nv_internal/.../moe_gemm_kernels.h` (line 53-55)
 - **FlashInfer MoE JIT:** `flashinfer/jit/fused_moe.py` (`gen_cutlass_fused_moe_module`)
 - **TRT-LLM tile configs:** `trtllmGen_bmm_export/config.json`
@@ -1294,6 +1326,6 @@ The extra pipeline stage improves latency hiding, particularly beneficial for:
 - **FlashInfer autotuner:** `flashinfer/autotuner.py`
 - **Current launcher:** `moe_gemm_sm120_mixed_input_launcher.inl`
 
-### 19.2 External PRs (M/N Swap Solution)
+### 20.2 External PRs (M/N Swap Solution)
 - **FlashInfer PR 2327:** [M/N swap for small-M decode](https://github.com/flashinfer-ai/flashinfer/pull/2327) - Core solution for tcgen05 M≥64 constraint
 - **CUTLASS PR 2946:** [N not divisible by 64 handling](https://github.com/NVIDIA/cutlass/pull/2946) - Required after M/N swap for proper epilogue

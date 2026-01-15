@@ -839,7 +839,7 @@ vllm serve openai/gpt-oss-120b \
 | `VLLM_ATTENTION_BACKEND` | FLASHINFER | Use FlashInfer for attention |
 | `VLLM_USE_CUDA_GRAPH` | 1 | Enable CUDA graphs (overridden by --enforce-eager) |
 | `FLASHINFER_NVCC_THREADS` | 4 | Parallel JIT compilation |
-| `FLASHINFER_CUDA_ARCH_LIST` | 12.1a | Target SM121 architecture |
+| `FLASHINFER_CUDA_ARCH_LIST` | 12.1f | Target SM121 architecture (family mode for FP4) |
 | `PYTHONPATH` | /workspace/flashinfer:/workspace/vllm | Use local repos |
 
 ### Production vs Dev Differences

@@ -51,17 +51,18 @@ This Docker setup enables running GPT-OSS-120B with native MXFP4 quantization on
 **The most important configuration for SM121 FP4 support:**
 
 ```bash
-# ❌ WRONG - Software FP4 emulation, will fail with cvt.e2m1x2 error
+# ❌ WRONG - Will fail with 'Feature not supported on .target sm_121'
 FLASHINFER_CUDA_ARCH_LIST="12.1"
+FLASHINFER_CUDA_ARCH_LIST="12.1a"  # Also wrong for FP4!
 
-# ✅ CORRECT - Hardware FP4 path enabled
-FLASHINFER_CUDA_ARCH_LIST="12.1a"
+# ✅ CORRECT - Hardware FP4/FP8 tensor core path enabled
+FLASHINFER_CUDA_ARCH_LIST="12.1f"
 ```
 
-The `a` suffix (or `f` for some architectures) enables `__CUDA_ARCH_FAMILY_SPECIFIC__`, which:
-- Activates hardware FP4 conversion instructions (`cvt.rn.satfinite.e2m1x2.f32`)
-- Enables architecture-specific optimizations
-- Without it, ptxas will error: `Feature 'cvt.e2m1x2.f32' not supported on .target 'sm_121'`
+The `f` suffix (family mode) is **required** for SM12x (Blackwell) FP4/FP8 tensor core features:
+- Activates block-scaled MMA instructions (`mma.kind::mxf4.block_scale`)
+- Enables FP4 ldmatrix with format conversion (`ldmatrix.b8x16.b4x16_p64`)
+- The `a` suffix incorrectly rejects these instructions on SM121
 
 ### Backend Comparison
 
@@ -254,7 +255,7 @@ docker compose -f docker-compose.dev.yml --profile serve up
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `FLASHINFER_CUDA_ARCH_LIST` | `12.1a` | **Critical:** Must include `a` suffix for hardware FP4 |
+| `FLASHINFER_CUDA_ARCH_LIST` | `12.1f` | **Critical:** Must use `f` suffix for hardware FP4/FP8 |
 | `VLLM_USE_FLASHINFER_MOE_MXFP4_BF16` | `1` | Enable MXFP4 BF16 backend (CUTLASS) |
 | `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8` | `0` | Disable MXFP8 TRTLLM (not SM121) |
 | `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS` | `0` | Disable MXFP8 CUTLASS |
@@ -331,7 +332,7 @@ curl http://localhost:8000/v1/chat/completions \
 **Root Cause:** Missing `a` suffix in architecture specification.
 
 **Fix:**
-1. Ensure `FLASHINFER_CUDA_ARCH_LIST="12.1a"` (with the `a` suffix)
+1. Ensure `FLASHINFER_CUDA_ARCH_LIST="12.1f"` (with the `f` suffix for family mode)
 2. Clear FlashInfer cache: `rm -rf ~/.cache/flashinfer/` (or `./.cache/flashinfer/` if using volume mounts)
 3. Rebuild/restart container
 
@@ -721,11 +722,11 @@ tail -f /root/.cache/flashinfer/*/cached_ops/fused_moe_120/*.log
 The `FLASHINFER_CUDA_ARCH_LIST` environment variable controls target architectures:
 
 ```bash
-# SM121 with architecture-specific features (hardware FP4)
-export FLASHINFER_CUDA_ARCH_LIST="12.1a"
+# SM121 with family mode features (hardware FP4/FP8 tensor cores)
+export FLASHINFER_CUDA_ARCH_LIST="12.1f"
 
 # Multiple architectures (for broader compatibility)
-export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 12.1a"
+export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 12.1f"
 ```
 
 **Important:** The `a` suffix enables architecture-specific features. Without it, some hardware paths (like FP4 conversion) fall back to software emulation.

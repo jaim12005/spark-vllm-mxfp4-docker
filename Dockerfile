@@ -94,7 +94,7 @@ WORKDIR ${VLLM_BASE_DIR}
 
 # Install FlashInfer with SM121 architecture target
 # JIT compilation will generate kernels for SM121 (DGX Spark)
-ENV FLASHINFER_CUDA_ARCH_LIST="12.1a"
+ENV FLASHINFER_CUDA_ARCH_LIST="12.1f"
 
 # Install FlashInfer using UV with cache mount
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
