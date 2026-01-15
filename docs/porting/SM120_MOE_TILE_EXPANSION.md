@@ -1085,12 +1085,106 @@ All supported tile configurations now compile successfully:
 - N must be power of 2: 8, 16, 32, 64, 128, or 256 (smem layout atom constraint)
 - Non-power-of-2 N values fail due to `ldmatrix` copy atom alignment requirements
 
-### 17.5 Benefits
+### 17.5 Shared Memory Constraints
 
-1. **Simpler code**: No transposed/swap logic complexity
+SM120 (GB10) has limited shared memory compared to SM100 (Blackwell B200):
+
+```
+SM120 (GB10):     101,376 bytes (~99 KB)
+SM100 (B200):     232,448 bytes (~227 KB)
+```
+
+These values can be queried from the hardware:
+```python
+import torch
+props = torch.cuda.get_device_properties(0)
+print(props.shared_memory_per_block_optin)  # 101376 on GB10
+```
+
+**Shared Memory Budget:**
+
+The total shared memory is divided between:
+1. **Epilogue carveout** - Reserved for output staging and fusion operations
+2. **Mainloop stages** - A/B tensors, scale factors, pipeline barriers
+
+**Epilogue Optimization:**
+
+The original SM120 epilogue used a prescriptive (64, 32) tile, wasting ~6 KB of shared memory.
+We optimized this to (64, 16) for most tiles:
+
+| Tile | Old Epilogue | New Epilogue | Savings |
+|------|--------------|--------------|---------|
+| (64, 32+) | (64, 32) = 13,312 bytes | (64, 16) = 7,168 bytes | 6,144 bytes |
+| (128, 32+) | (64, 32) = 13,312 bytes | (64, 16) = 7,168 bytes | 6,144 bytes |
+
+**Hardware Constraint:** Epilogue tile M must be divisible by MMA tile M (64), limiting how small we can make the epilogue.
+
+**Pipeline Stage Calculation:**
+
+CUTLASS requires >= 2 pipeline stages for double-buffering (latency hiding). Stage count is:
+```
+stages = (smem_capacity - epilogue_carveout) / stage_bytes
+```
+
+Where `stage_bytes` includes:
+- A tensor (FP8 stored as uint8_t): M × K bytes
+- B tensor (FP4 stored as uint8_t): N × K bytes (NOT N × K / 2!)
+- Scale factors A: ~512 bytes
+- Scale factors B: ~N × 4 bytes
+- Pipeline barriers: ~16 bytes
+
+**Why (128, 256) Fails:**
+
+Even with optimized epilogue (7,168 bytes):
+```
+Available for mainloop: 101,376 - 7,168 = 94,208 bytes
+Per stage:
+  A: 128 × 128 = 16,384 bytes
+  B: 256 × 128 = 32,768 bytes (FP4 stored as uint8_t!)
+  SF: ~1,536 bytes
+  Pipeline: ~16 bytes
+  Total: ~50,704 bytes
+
+Stages: 94,208 / 50,704 = 1.86 (need >= 2)
+```
+
+**Key Insight:** The B tensor uses `uint8_t` storage (not packed FP4), doubling its footprint.
+If CUTLASS supported true 4-bit packing, B would be 16,384 bytes and (128, 256) would fit.
+
+### 17.6 Complete Tile Support with swap_ab
+
+With `swap_ab=True`, logical (M, N) becomes physical (N, M). This enables:
+- Small logical M (8, 16, 32) by making physical M = logical N (64 or 128)
+- Large logical M (256) when physical layout fits in smem
+
+**Complete Logical Tile Matrix:**
+
+| Logical M | Supported Logical N | swap_ab | Physical (M, N) |
+|-----------|---------------------|---------|-----------------|
+| 8 | 64, 128 | True | (64, 8), (128, 8) |
+| 16 | 64, 128 | True | (64, 16), (128, 16) |
+| 32 | 64, 128 | True | (64, 32), (128, 32) |
+| 64 | 8, 16, 32, 64, 128, 256 | False | (64, N) |
+| 128 | 8, 16, 32, 64, 128 | False | (128, N) |
+| 256 | 64 | True | (64, 256) |
+
+**Summary:**
+- **Verified (no swap):** 11 tiles - M ∈ {64, 128}, N ∈ {8, 16, 32, 64, 128, 256} excluding (128, 256)
+- **Theoretical (with swap):** 7 tiles - M ∈ {8, 16, 32}, N ∈ {64, 128} plus (256, 64)
+- **Total potential:** 18 unique logical tile configurations
+
+**Known to Fail (smem overflow):**
+- (128, 256): only 1 stage fits
+- (256, 128), (256, 256): physical too large
+- (512, *): any M=512 configuration
+
+### 17.7 Benefits
+
+1. **Simpler code**: No transposed/swap logic complexity (for no-swap tiles)
 2. **Fewer kernel variants**: Single code path for all M sizes
 3. **Native efficiency**: Hardware directly supports M=64 without layout transformations
 4. **Expanded tile selection**: More options for autotuning
+5. **Small-batch decode**: swap_ab enables M < 64 for single-token inference
 
 ---
 
