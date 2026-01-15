@@ -53,38 +53,40 @@ def test_tile_compile(tile_mn: tuple[int, int]) -> bool:
 
 
 def main():
-    # Test configurations in order
-    # SM120 MXFP4 constraints:
-    #   - M >= 64, multiple of 64 (tcgen05 hardware minimum)
-    #   - N >= 32, multiple of 32 (smem copy atom minimum)
+    # Test configurations - SM120 MXFP4 constraints:
+    #   - M must be multiple of 64 (tcgen05 hardware minimum)
+    #   - N must be power of 2 in {8, 16, 32, 64, 128, 256}
+    #   - (128, 256) exceeds smem capacity
     # Both M < 128 and N < 128 are padded to 128 internally for scale factor layouts
-    # Note: N=16 and N=8 fail due to TiledCopy atom size constraints
+    # The sm120_rr_smem_copy_selector_B selects appropriate copy atom based on TileN
     configs = [
-        (128, 128),  # Standard: 128x128 (default)
-        (128, 64),   # Standard: 128x64
-        (128, 32),   # Standard: 128x32 (smallest N)
-        (64, 128),   # M=64: 64x128
-        (64, 64),    # M=64: 64x64
-        (64, 32),    # M=64: 64x32 (smallest tile)
+        # M=64: all N values fit
+        (64, 8), (64, 16), (64, 32), (64, 64), (64, 128), (64, 256),
+        # M=128: N=256 exceeds smem capacity
+        (128, 8), (128, 16), (128, 32), (128, 64), (128, 128),
     ]
     
     results = {}
+    failed = []
     for tile_mn in configs:
         ok = test_tile_compile(tile_mn)
         results[tile_mn] = ok
         if not ok:
-            print(f"\n[STOP] tile_mn={tile_mn} failed, stopping further tests")
-            break
+            failed.append(tile_mn)
+            # Continue testing other configs instead of stopping
     
     print(f"\n{'='*60}")
     print("RESULTS:")
     print(f"{'='*60}")
-    for tile_mn, ok in results.items():
-        status = "OK" if ok else "FAIL"
-        print(f"  {tile_mn}: {status}")
+    passed = [t for t, ok in results.items() if ok]
+    print(f"  PASSED: {len(passed)}/{len(configs)}")
+    if failed:
+        print(f"  FAILED: {failed}")
+    else:
+        print("  All configurations compiled successfully!")
     
     # Exit with error if any failed
-    if not all(results.values()):
+    if failed:
         sys.exit(1)
 
 

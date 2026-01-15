@@ -1012,32 +1012,41 @@ And from the descriptor encoding (`mma_sm100_desc.hpp`):
 m_dim_: 5,  // bit [24,29) : 4 LSBs not included. Valid values are: 4 (M=64), 8 (M=128), 16 (M=256)
 ```
 
-### 17.2 CUTLASS Framework Patches for M < 128
+### 17.2 CUTLASS Framework Patches for M < 128 and N < 128
 
-The same issue that affected N < 128 (see Section 16) also affects M < 128. Applied the same fix:
+The same issue that affected N < 128 (see Section 16) also affects M < 128. Applied the same fix using `cute::ceil_div` (NOT `cutlass::ceil_div` - see note below):
 
 **File: `sm120_blockscaled_mma_builder.inl`**
 ```cpp
 // M dimension must be rounded up to at least Blk_MN (128) for TMA and UTCCP to work.
-// This matches the ceil_div logic in Sm1xxBlockScaledConfig::deduce_smem_layoutSFA.
-static constexpr int TileM_SFA = cutlass::ceil_div(cute::size<0>(TileShape_MNK{}), Blk_MN{}) * Blk_MN{};
+static constexpr int TileM_SFA = cute::ceil_div(cute::size<0>(TileShape_MNK{}), Blk_MN{}) * Blk_MN{};
 using sSFA_shapeM  = decltype(prepend(Int<TileM_SFA>{} / Blk_MN{}, mnBasicBlockShape{}));
 using sSFA_strideK = decltype(prepend(make_stride(Int<MMA_NSF>{}, Int<TileM_SFA>{} / Blk_MN{} * Blk_Elems{}), kBasicBlockStride{}));
+
+// N dimension padding for SFB (same approach)
+static constexpr int TileN_SFB = cute::ceil_div(cute::size<1>(TileShape_MNK{}), Blk_MN{}) * Blk_MN{};
 ```
 
 **File: `sm120_blockscaled_mma_array_tma.hpp`**
 ```cpp
 // Scale factor A tile shape - M dimension padded to at least 128 for TMA
-static constexpr int TileM_SFA = cutlass::ceil_div(cute::size<0>(TileShape{}), Blk_MN{}) * Blk_MN{};
+static constexpr int TileM_SFA = cute::ceil_div(cute::size<0>(TileShape{}), Blk_MN{}) * Blk_MN{};
 using TileShape_SFA = decltype(cute::make_shape(cute::Int<TileM_SFA>{}, cute::size<2>(TileShape{})));
-static constexpr bool IsCtaM64 = cute::size<0>(TileShape{}) == 64;
+static constexpr bool IsCtaMSmall = cute::size<0>(TileShape{}) < 128;
 
-// Use TileShape_SFA for TMA_SFA descriptor creation
-using TMA_SFA = decltype(make_tma_copy<uint16_t>(..., TileShape_SFA{}, ...));
+// Scale factor B tile shape - N dimension padded to at least 128 for TMA
+static constexpr int TileN_SFB = cute::ceil_div(cute::size<1>(TileShape{}), Blk_MN{}) * Blk_MN{};
+using TileShape_SFB = decltype(cute::make_shape(cute::Int<TileN_SFB>{}, cute::size<2>(TileShape{})));
+static constexpr bool IsCtaNSmall = cute::size<1>(TileShape{}) < 128;
 
-// Skip size assertion for padded M=64 case
-if constexpr (!IsCtaM64) { CUTE_STATIC_ASSERT_V(size<1>(tCrSFA) == size<1>(accum)); }
+// Skip size assertions for padded cases
+if constexpr (!IsCtaMSmall) { CUTE_STATIC_ASSERT_V(size<1>(tCrSFA) == size<1>(accum)); }
+if constexpr (!IsCtaNSmall) { CUTE_STATIC_ASSERT_V(size<1>(tCrSFB) == size<2>(accum)); }
 ```
+
+**CRITICAL: Use `cute::ceil_div`, NOT `cutlass::ceil_div`**
+
+The `cutlass::ceil_div` function is designed for runtime integer division, while `cute::ceil_div` handles compile-time `cute::Int` constants correctly. Using the wrong one causes template instantiation failures in TMA copy creation.
 
 ### 17.3 Eliminating SWAP_AB
 
@@ -1053,14 +1062,28 @@ swap_ab = False
 
 ### 17.4 Verified Tile Configurations
 
-All combinations now compile successfully:
+All supported tile configurations now compile successfully:
 
 | Tile (M, N) | Scale Factor Padding | Notes |
 |-------------|---------------------|-------|
+| (64, 8) | SFA, SFB padded | Smallest N |
+| (64, 16) | SFA, SFB padded | Small N |
+| (64, 32) | SFA, SFB padded | Minimal decode |
+| (64, 64) | SFA, SFB padded | Small decode |
+| (64, 128) | SFA padded | Standard decode |
+| (64, 256) | SFA padded | Large N decode |
+| (128, 8) | SFB padded | Smallest N |
+| (128, 16) | SFB padded | Small N |
+| (128, 32) | SFB padded | |
+| (128, 64) | SFB padded | |
 | (128, 128) | None | Standard, default |
-| (128, 64) | SFB padded | Smaller N |
-| (64, 128) | SFA padded | Smaller M (decode) |
-| (64, 64) | Both padded | Smallest tile |
+
+**Note:** (128, 256) exceeds shared memory capacity (requires Stages >= 2, only 1 fits).
+
+**Constraints:**
+- M must be multiple of 64 (tcgen05 hardware minimum)
+- N must be power of 2: 8, 16, 32, 64, 128, or 256 (smem layout atom constraint)
+- Non-power-of-2 N values fail due to `ldmatrix` copy atom alignment requirements
 
 ### 17.5 Benefits
 
