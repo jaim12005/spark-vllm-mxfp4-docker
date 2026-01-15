@@ -25,6 +25,13 @@ Make **vLLM the fastest inference engine for gpt-oss-120b** on NVIDIA GB10 (SM12
 - avoid self-promotion like 'ai-assisted'
 - do not generate copywrites in new files
 - **NEVER revert work** - even if a fix is incomplete or has issues, keep the progress and iterate forward. The user strongly dislikes reverting changes. Document limitations instead of undoing work.
+  - This includes: `git checkout --`, `git reset`, `git checkout -B <branch> <upstream>` that would lose commits
+  - When asked to "sync with upstream" or "switch branches", ALWAYS preserve existing patches:
+    1. First, identify what patches/commits exist on the current branch
+    2. Rebase onto upstream rather than resetting (preserves commits)
+    3. Or cherry-pick/re-apply patches after any reset
+  - When in doubt, ASK before any operation that could lose work
+  - If work must be redone, use the previous implementation as a reference rather than reimplementing from scratch
 
 ### Code Search Warning
 
