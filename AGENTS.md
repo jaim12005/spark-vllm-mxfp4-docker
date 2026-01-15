@@ -23,7 +23,8 @@ Make **vLLM the fastest inference engine for gpt-oss-120b** on NVIDIA GB10 (SM12
 ## notes
 - we do not require time estimates in plans
 - avoid self-promotion like 'ai-assisted'
-- do not generate copywrites in new files
+- **NEVER modify existing copyright headers** in any file
+- **NEVER add copyright headers** to new or existing files
 - **NEVER revert work** - even if a fix is incomplete or has issues, keep the progress and iterate forward. The user strongly dislikes reverting changes. Document limitations instead of undoing work.
   - This includes: `git checkout --`, `git reset`, `git checkout -B <branch> <upstream>` that would lose commits
   - When asked to "sync with upstream" or "switch branches", ALWAYS preserve existing patches:
