@@ -54,12 +54,14 @@ def test_tile_compile(tile_mn: tuple[int, int]) -> bool:
 
 def main():
     # Test configurations in order
-    # SM120 MXFP4 TMA constraints: M >= 64, N >= 64 (padded to 128 internally for SF)
+    # SM120 MXFP4 TMA constraints: M >= 64, N >= 32 (padded to 128 internally for SF)
     configs = [
         (128, 128),  # Standard: 128x128 (default)
-        (128, 64),   # Standard: 128x64 (smaller N, tests TileShape_SFB padding)
-        (64, 128),   # M=64 without swap (tests TileShape_SFA padding)
-        (64, 64),    # Both M and N = 64 (tests both paddings)
+        (128, 64),   # Standard: 128x64 (smaller N)
+        (128, 32),   # Standard: 128x32 (smallest N per CUTLASS builder)
+        (64, 128),   # M=64 (tests TileShape_SFA padding)
+        (64, 64),    # Both M and N small
+        (64, 32),    # Smallest practical tile for decode
     ]
     
     results = {}
