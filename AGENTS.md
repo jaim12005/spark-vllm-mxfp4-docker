@@ -26,11 +26,17 @@ Make **vLLM the fastest inference engine for gpt-oss-120b** on NVIDIA GB10 (SM12
 - **NEVER modify existing copyright headers** in any file
 - **NEVER add copyright headers** to new or existing files
 - **NEVER revert work** - even if a fix is incomplete or has issues, keep the progress and iterate forward. The user strongly dislikes reverting changes. Document limitations instead of undoing work.
-  - This includes: `git checkout --`, `git reset`, `git checkout -B <branch> <upstream>` that would lose commits
+  - **Git reverts**: Don't use `git checkout --`, `git reset`, `git checkout -B <branch> <upstream>` that would lose commits
+  - **Code reverts**: When hitting an error after making a change, do NOT immediately revert the code change. Instead:
+    1. **Investigate**: Is the constraint real (hardware/fundamental) or artificial (conservative defaults, untested assumptions)?
+    2. **Ask**: If unsure, ask the user before reverting
+    3. **Document**: If the constraint is real, document why and THEN consider alternatives
+    4. **Iterate forward**: Try to fix the error with the new code, not by reverting to old code
   - When asked to "sync with upstream" or "switch branches", ALWAYS preserve existing patches:
     1. First, identify what patches/commits exist on the current branch
     2. Rebase onto upstream rather than resetting (preserves commits)
     3. Or cherry-pick/re-apply patches after any reset
+  - **Example of bad behavior**: Hit "Ambiguous scatter" error with EpiN=8, immediately reverted to EpiN=16. Should have investigated: Is this a hardware limit? A swizzle pattern choice? Can the swizzle be changed?
   - When in doubt, ASK before any operation that could lose work
   - If work must be redone, use the previous implementation as a reference rather than reimplementing from scratch
 
