@@ -1188,9 +1188,103 @@ With `swap_ab=True`, logical (M, N) becomes physical (N, M). This enables:
 
 ---
 
-## 18. References
+## 18. FP4 Shared Memory Optimization (CUTLASS Patch Applied)
 
-### Internal
+> **✅ FIXED (2026-01-15):** Applied patch to CUTLASS SM120 block-scaled builders to correctly
+> allocate shared memory for FP4 weights. This enables +1 pipeline stage for most tile configs.
+
+### 18.1 Original Bug
+
+For MXFP4 (FP8 activations × FP4 weights), the B tensor shared memory was allocated as if each
+FP4 element occupies 1 byte (8 bits), when it should only occupy 0.5 bytes (4 bits).
+
+| Tile (128, 128, 128) | Before Fix | After Fix | Improvement |
+|---------------------|------------|-----------|-------------|
+| B tensor smem | 16,384 bytes | 8,192 bytes | 50% reduction |
+| Per-stage total | ~33 KB | ~25 KB | -8 KB |
+| Pipeline stages | 3 | 4 | +1 stage |
+
+### 18.2 Root Cause
+
+In `sm120_blockscaled_mma_builder.inl`, `SmemAllocTypeB` was set to `uint8_t` for all uses:
+- SmemLayoutAtomB (layout sizing)
+- SmemCopyAtomB (copy operations)
+- ArrayEngine allocation
+- Stage calculation
+
+But these have different requirements:
+- **Layout/Allocation**: Should use FP4 for correct sizing (4 bits per element)
+- **Copy Atom**: Must use uint8 for `SM100_SU4_DU8` instruction compatibility
+
+### 18.3 The Fix
+
+Introduced separate types for different purposes:
+
+```cpp
+// sm120_blockscaled_mma_builder.inl
+using SmemCopyTypeB = cute::conditional_t<UseMxf8f6f4, uint8_t, ...>;    // For copy atom
+using SmemLayoutTypeB = cute::conditional_t<UseMxf8f6f4, ElementB, ...>; // For layout
+
+// SmemLayoutAtomB uses FP4 type for correct element count
+using SmemLayoutAtomB = sm120_rr_smem_selector<SmemLayoutTypeB, K>();
+
+// SmemCopyAtomB uses uint8 for SU4_DU8 compatibility  
+using SmemCopyAtomB = Copy_Atom<..., SmemCopyTypeB>;
+
+// Stage calculation uses FP4 bit width
+static constexpr int PipelineStages = sm100_compute_stage_count_or_override_blockscaled<
+    ..., SmemAllocTypeA, SmemLayoutTypeB, ...>();
+```
+
+And in mainloop files (`sm120_blockscaled_mma_tma.hpp`, `sm120_blockscaled_mma_array_tma.hpp`):
+
+```cpp
+// ArrayEngine uses ElementB (FP4) so array_subbyte packs 2 per byte
+using SmemAllocTypeB = cute::conditional_t<IsF8F6F4, ElementB, ...>;
+alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
+```
+
+### 18.4 Files Modified
+
+1. `cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl`
+2. `cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp`
+3. `cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp`
+
+### 18.5 Verified Tile Configurations
+
+All tiles compile after the fix:
+
+**Native (M >= 64):**
+- M=64: (64, 8), (64, 16), (64, 32), (64, 64), (64, 128), (64, 256)
+- M=128: (128, 8), (128, 16), (128, 32), (128, 64), (128, 128), **(128, 256) NEW**
+- M=256: (256, 8), (256, 16), (256, 32), (256, 64), **(256, 128) NEW**
+
+**Swapped (logical M < 64):**
+- Logical M=8: (8, 64), (8, 128), **(8, 256) NEW**
+- Logical M=16: (16, 64), (16, 128), **(16, 256) NEW**
+- Logical M=32: (32, 64), (32, 128), **(32, 256) NEW**
+
+**Total: 26 tiles (17 native + 9 swapped)**
+
+### 18.6 New Tiles Enabled
+
+The FP4 smem optimization enables 5 new tile configurations:
+- **(128, 256)**: Large prefill with wide N
+- **(256, 128)**: Very large prefill batches
+- **(8, 256), (16, 256), (32, 256)**: Small decode with wide intermediate
+
+### 18.7 Performance Impact
+
+The extra pipeline stage improves latency hiding, particularly beneficial for:
+- Memory-bound workloads
+- Smaller batch sizes where each stage matters more
+- Enabling larger tiles that previously exceeded smem capacity
+
+---
+
+## 19. References
+
+### 19.1 Internal
 - **FlashInfer GEMM layout:** `csrc/nv_internal/.../moe_gemm_kernels.h` (line 53-55)
 - **FlashInfer MoE JIT:** `flashinfer/jit/fused_moe.py` (`gen_cutlass_fused_moe_module`)
 - **TRT-LLM tile configs:** `trtllmGen_bmm_export/config.json`
@@ -1200,6 +1294,6 @@ With `swap_ab=True`, logical (M, N) becomes physical (N, M). This enables:
 - **FlashInfer autotuner:** `flashinfer/autotuner.py`
 - **Current launcher:** `moe_gemm_sm120_mixed_input_launcher.inl`
 
-### External PRs (M/N Swap Solution)
+### 19.2 External PRs (M/N Swap Solution)
 - **FlashInfer PR 2327:** [M/N swap for small-M decode](https://github.com/flashinfer-ai/flashinfer/pull/2327) - Core solution for tcgen05 M≥64 constraint
 - **CUTLASS PR 2946:** [N not divisible by 64 handling](https://github.com/NVIDIA/cutlass/pull/2946) - Required after M/N swap for proper epilogue
