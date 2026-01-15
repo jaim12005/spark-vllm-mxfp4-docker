@@ -54,6 +54,51 @@ grep -rn "^class " /workspace/flashinfer/flashinfer/fused_moe/core.py
 
 **When in doubt:** Use `cat` to read the actual file and verify content matches what search tools report.
 
+### FlashInfer/CUTLASS C++ Coding Restrictions
+
+FlashInfer and CUTLASS use **C++17** (not C++20). This affects template metaprogramming patterns:
+
+**❌ C++20 features that will NOT compile:**
+
+```cpp
+// Non-type template parameters of class type (C++20 only)
+template<auto Shape>  // FAILS: class type NTTP requires C++20
+struct MyKernel { ... };
+
+// Direct use of constexpr class objects as template args
+using TileShape_SF = cute::Shape<cute::Int<128>, cute::Int<128>>;  // FAILS
+```
+
+**✓ C++17 workarounds that DO compile:**
+
+```cpp
+// Use decltype(make_shape(...)) pattern for type aliases
+using TileShape_SFA = decltype(cute::make_shape(cute::Int<TileM_SFA>{}, cute::size<2>(TileShape{})));
+
+// Use static constexpr for values, then wrap in Int<>
+static constexpr int TileM_SFA = cutlass::ceil_div(...) * 128;
+using sSFA_shapeM = decltype(prepend(Int<TileM_SFA>{} / Blk_MN{}, ...));
+
+// Use if constexpr for conditional compile-time logic
+if constexpr (!IsCtaM64) { CUTE_STATIC_ASSERT_V(...); }
+```
+
+**Key patterns in CUTLASS/CUTE:**
+
+| Pattern | Usage |
+|---------|-------|
+| `cute::Int<N>{}` | Compile-time integer constant |
+| `cute::size<I>(Shape{})` | Extract Ith dimension of a shape |
+| `cute::shape<I>(Shape{})` | Same as size<I> |
+| `decltype(cute::make_shape(...))` | Create shape type from components |
+| `cutlass::ceil_div(a, b)` | Ceiling division for padding |
+| `CUTE_STATIC_ASSERT_V(...)` | Compile-time shape validation |
+
+**Compilation flags used:**
+- `-std=c++17` for all JIT compilation
+- `-gencode=arch=compute_121a,code=sm_121a` for SM121
+- CUTLASS uses `CMAKE_CXX_STANDARD 17`
+
 ## Implementation Stack
 
 ### WE ARE USING
