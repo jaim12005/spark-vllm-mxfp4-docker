@@ -24,6 +24,35 @@ Make **vLLM the fastest inference engine for gpt-oss-120b** on NVIDIA GB10 (SM12
 - we do not require time estimates in plans
 - avoid self-promotion like 'ai-assisted'
 - do not generate copywrites in new files
+- **NEVER revert work** - even if a fix is incomplete or has issues, keep the progress and iterate forward. The user strongly dislikes reverting changes. Document limitations instead of undoing work.
+
+### Code Search Warning
+
+**ripgrep (`rg`) and internal IDE/agent search tools regularly return stale or incomplete results** in this project. This appears to be due to filesystem caching, Docker volume mounts, or index staleness.
+
+**Always use traditional shell commands for code search:**
+
+```bash
+# Find files by name
+find /workspace/flashinfer -name "*.py" | xargs grep -l "pattern"
+
+# Search file contents
+grep -rn "pattern" /workspace/flashinfer/flashinfer/
+
+# Search with context
+grep -rn -A3 -B3 "function_name" /workspace/flashinfer/
+
+# Find and read specific symbols
+grep -rn "^def select_tile" /workspace/flashinfer/flashinfer/fused_moe/
+grep -rn "^class " /workspace/flashinfer/flashinfer/fused_moe/core.py
+```
+
+**Do NOT rely on:**
+- `rg` (ripgrep) - returns stale/cached results
+- IDE "Find in Files" - may use stale index
+- Agent Grep/Glob tools - may show outdated file state
+
+**When in doubt:** Use `cat` to read the actual file and verify content matches what search tools report.
 
 ## Implementation Stack
 

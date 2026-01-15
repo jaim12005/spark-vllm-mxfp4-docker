@@ -1,5 +1,9 @@
 # SM120 MoE Tile Expansion Plan
 
+> **⚠️ KEY FINDING (2026-01-14):** The tcgen05 tensor core has a **hardware minimum of M=64**. 
+> Tiles smaller than 64 in the M dimension are impossible. The solution is to **swap M and N**
+> dimensions, leveraging N's minimum of 8. See [Section 15](#15-hardware-constraint-tcgen05-minimum-tile-sizes).
+
 ## Approach: JIT-Based Dynamic Tile Selection
 
 FlashInfer uses **JIT compilation** with disk caching, so we don't precompile variants.
@@ -77,6 +81,10 @@ not total input tokens. For decode with 1 token and top_k=8:
 
 For decode (1 token per expert), we compute a 128×N output tile but only need 1×N.
 **99.2% of the tile computation is wasted padding.**
+
+> **Hardware Constraint:** We cannot simply reduce TILE_M below 64 because tcgen05 tensor 
+> cores have a **minimum M tile size of 64**. See [Section 15](#15-hardware-constraint-tcgen05-minimum-tile-sizes)
+> for the M/N swap solution that works around this limitation.
 
 ---
 
@@ -428,14 +436,15 @@ using ClusterShape_MNK = CurrentTileConfig::ClusterShape_MNK;
 
 ### 7.1 Cache Structure
 
-After running with the minimal tile set, cache will contain:
+After running with all tile variants, cache will contain:
 
 ```
 $(flashinfer_cache_dir)/cached_ops/   # Use FlashInfer's cache dir, not hardcoded path
-├── fused_moe_120_M64_N128_K128/      # decode / small batch (safest small tile)
-│   └── fused_moe_120_M64_N128_K128.so
-└── fused_moe_120_M128_N128_K128/     # prefill / large batch
-    └── fused_moe_120_M128_N128_K128.so
+├── fused_moe_120_M8/                 # decode (1-8 tokens), transpose mode
+├── fused_moe_120_M16/                # decode (9-16 tokens), transpose mode
+├── fused_moe_120_M32/                # decode (17-32 tokens), transpose mode
+├── fused_moe_120/                    # default (128), standard mode
+└── fused_moe_120_M256/               # large batch prefill, standard mode
 ```
 
 **Note:** The actual path varies by FlashInfer version and GPU architecture.
@@ -444,15 +453,13 @@ than hardcoding `~/.cache/flashinfer/0.6.0/121a/...`.
 
 **Typical workload → tile mapping (gpt-oss-120b: 128 experts, top_k=8):**
 
-| Workload | Input Tokens | TILE_M |
-|----------|--------------|--------|
-| Decode (1-64 tokens) | 1-64 | **64** |
-| Large batch / Prefill | 65+ | **128** |
-
-**Start with 64+128.** After validating:
-1. Try 32 if 64 shows gains
-2. Try 16 if 32 works
-3. Try 8 only if 16 is clean
+| Workload | Input Tokens | TILE_M | Mode |
+|----------|--------------|--------|------|
+| Single decode | 1-8 | **8** | Transpose |
+| Small batch decode | 9-16 | **16** | Transpose |
+| Medium batch | 17-32 | **32** | Transpose |
+| Prefill / Large batch | 33-128 | **128** | Standard |
+| Very large batch | 129+ | **256** | Standard |
 
 ### 7.2 First-Call vs Cached Performance
 
@@ -533,14 +540,15 @@ To avoid JIT latency during inference:
 def prewarm_moe_tiles():
     """Pre-compile tile variants during server startup.
     
-    Start with just 2 tiles to minimize startup time:
-    - 64: decode and small batches (safest small tile)
-    - 128: prefill and large batches
+    Pre-warm commonly used tiles:
+    - 8, 16, 32: Decode-optimized (transpose mode)
+    - 128: Prefill-optimized (standard mode)
+    - 256: Large batch (optional, only if needed)
     
-    At ~20s per tile, this is ~40s startup cost.
-    Add smaller tiles (32, 16) only after validation.
+    At ~20s per tile, full set is ~80-100s startup cost.
     """
-    TILES_TO_PREWARM = [64, 128]  # Minimal safe set
+    TILES_TO_PREWARM = [8, 16, 32, 128]  # Core set
+    # Add 256 if you expect very large batches
     for tile_m in TILES_TO_PREWARM:
         _ = get_cutlass_fused_moe_module(backend="120", tile_m=tile_m)
     print(f"Prewarmed {len(TILES_TO_PREWARM)} MoE tile variants")
@@ -549,9 +557,9 @@ def prewarm_moe_tiles():
 **Startup cost:**
 | Tiles | Compile Time | Use Case |
 |-------|--------------|----------|
-| 2 (64, 128) | ~40s | **Recommended starting point** |
-| 3 (32, 64, 128) | ~60s | After 64 shows gains |
-| 4 (16, 32, 64, 128) | ~80s | After 32 is validated |
+| 2 (32, 128) | ~40s | Minimal decode + prefill |
+| 4 (8, 16, 32, 128) | ~80s | **Recommended for full decode optimization** |
+| 5 (8, 16, 32, 128, 256) | ~100s | Full set including large batch |
 
 ---
 
@@ -787,8 +795,285 @@ token_selected_experts[:, :] = 0  # Expert 0 gets everything
 
 ---
 
-## 12. References
+## 13. Status Update (2026-01-14)
 
+### Implemented (v2 - Macro-based with M/N Swap)
+
+**Supported Tile Sizes**: `[8, 16, 32, 128, 256]`
+
+| TILE_M | Mode | Namespace | Description |
+|--------|------|-----------|-------------|
+| 8 | Transpose | `sm120_mxfp4_bf16_transposed_8` | Decode-optimized (N=8) |
+| 16 | Transpose | `sm120_mxfp4_bf16_transposed_16` | Decode-optimized (N=16) |
+| 32 | Transpose | `sm120_mxfp4_bf16_transposed_32` | Decode-optimized (N=32) |
+| 128 | Standard | `sm120_mxfp4_bf16_128x128x128` | Prefill-optimized |
+| 256 | Standard | `sm120_mxfp4_bf16_256x256x128` | Large batch prefill |
+
+**Key Changes:**
+- **Macro-based namespaces**: `DEFINE_SM120_MXFP4_STANDARD_NAMESPACE` and `DEFINE_SM120_MXFP4_TRANSPOSED_NAMESPACE` reduce duplication
+- **M/N Swap for small tiles**: Tiles < 128 use transpose mode to work around tcgen05 M≥64 constraint
+- **Python threshold selection**: `select_tile_m_for_sm120()` picks smallest tile that fits token count
+- **JIT cache separation**: Each tile size compiles to separate `.so` file
+
+### Implementation Details
+
+**C++ Launcher** (`moe_gemm_sm120_mixed_input_launcher.inl`):
+- Two macros generate namespace contents (standard vs transposed)
+- `#if TILE_M < 128` selects transpose mode, swapping A/B pointers
+- Transposed mode: ElementInputA=FP4, ElementInputB=FP8, LayoutC=ColumnMajor
+
+**Python Selection** (`flashinfer/fused_moe/core.py`):
+```python
+SM120_SUPPORTED_TILE_M = (8, 16, 32, 128, 256)
+SM120_TILE_THRESHOLDS = [
+    (8, 8),      # 1-8 tokens -> TILE_M=8
+    (16, 16),    # 9-16 tokens -> TILE_M=16
+    (32, 32),    # 17-32 tokens -> TILE_M=32
+    (128, 128),  # 33-128 tokens -> TILE_M=128
+]
+SM120_DEFAULT_TILE_M = 256  # > 128 tokens
+```
+
+### Resolved Issues
+- **M=64 removed**: The tcgen05 M≥64 constraint made TILE_M=64 problematic. Replaced with M/N swap.
+- **TILE_M=64 references removed**: No longer used; smallest standard tile is 128.
+
+---
+
+## 15. Hardware Constraint: tcgen05 Minimum Tile Sizes
+
+### 15.1 The Fundamental Constraint
+
+On SM120/SM121 (Blackwell), the `tcgen05` tensor core instructions have **asymmetric minimum tile requirements**:
+
+| Dimension | Minimum Tile Size | Notes |
+|-----------|-------------------|-------|
+| **M** | **64** | Token dimension - this is our bottleneck |
+| **N** | **8** | Output dimension - much more flexible |
+| **K** | Varies | Reduction dimension |
+
+**This explains the tile size limits**: The hardware cannot execute an MMA with M < 64 for tcgen05. Tiles smaller than 64 (32, 16, 8) are impossible. TILE_M=64 should work as it's at the minimum, but our compilation failure (Section 13) may be due to other CUTLASS/TMA constraints, not this hardware minimum. The M/N swap approach sidesteps this entirely by making the small dimension N instead.
+
+### 15.2 The M/N Swap Solution (FlashInfer PR 2327)
+
+**Key insight**: Since M minimum is 64 but N minimum is only 8, we can **swap the matrix operands** to put the small dimension in N instead of M.
+
+**Standard GEMM layout:**
+```
+C[M,N] = A[M,K] × B[K,N]
+
+For decode (1 token per expert):
+  M = 1 (tokens) ← PROBLEM: minimum is 64!
+  N = 14336 (intermediate_size)
+  K = 5120 (hidden_size)
+```
+
+**Swapped GEMM layout:**
+```
+C^T[N,M] = B^T[N,K] × A^T[K,M]
+
+After transpose/swap:
+  M' = 14336 (was N) ← Now the large dimension, tile M = 128
+  N' = 1 (was M) ← Now the small dimension, tile N = 8/16/32
+  K' = 5120 (unchanged)
+```
+
+**⚠️ CONSTRAINT: After swapping, the new M dimension (original N) must be divisible by 128.**
+
+This means the model's `intermediate_size` and `hidden_size` must be multiples of 128:
+
+| Model | intermediate_size | hidden_size | Divisible by 128? |
+|-------|------------------|-------------|-------------------|
+| gpt-oss-120b | 14336 | 5120 | ✅ 14336/128=112, 5120/128=40 |
+| Llama-3-70B | 28672 | 8192 | ✅ 28672/128=224, 8192/128=64 |
+| Mixtral-8x7B | 14336 | 4096 | ✅ 14336/128=112, 4096/128=32 |
+
+Most models satisfy this since hidden sizes are typically powers of 2 or multiples of 256.
+
+**Implementation approach:**
+1. Swap A and B operand pointers in the GEMM call
+2. Tile shape: M=128 (fixed), N=8/16/32 (small token dim)
+3. Output LayoutC = ColumnMajor (writes D^T which matches D in row-major)
+
+**Reference:** [FlashInfer PR 2327](https://github.com/flashinfer-ai/flashinfer/pull/2327)
+
+### 15.3 Post-Swap: N Not Divisible by 64 (CUTLASS PR 2946)
+
+After swapping, the original N dimension (e.g., 14336) becomes M, and the original M (tokens) becomes N.
+
+**New problem**: After the swap, what was the fixed output dimension (14336) is now M. Since M must be processed in tiles of at least 64, the epilogue needs to handle cases where this isn't cleanly divisible.
+
+**CUTLASS PR 2946** adds support for scenarios where:
+- The swapped-N dimension (original M = tokens) is small (1-16)
+- The swapped-M dimension (original N = output dim) may not be divisible by 64
+
+**Reference:** [CUTLASS PR 2946](https://github.com/NVIDIA/cutlass/pull/2946)
+
+### 15.4 Implementation Path Forward
+
+Given the hardware constraint, our implementation uses M/N swap for small tiles:
+
+| Approach | Complexity | Expected Gain | Status |
+|----------|------------|---------------|--------|
+| **TILE_M=128, 256 (standard)** | None | Baseline | ✅ Implemented |
+| **TILE_M=8, 16, 32 (transpose)** | Medium | Full decode optimization (N min=8) | ✅ **Implemented** |
+| **TILE_M=64 (standard)** | N/A | N/A | ❌ Removed (tcgen05 M≥64 constraint) |
+
+**Implementation approach (completed):**
+1. ✅ **Macro-based namespaces**: Reduce duplication with `DEFINE_SM120_MXFP4_TRANSPOSED_NAMESPACE`
+2. ✅ **M/N swap in launcher**: `#if TILE_M < 128` swaps A/B pointers and uses ColumnMajor output
+3. ✅ **Python tile selection**: Threshold-based selection picks smallest tile that fits
+4. 🔄 **Benchmark**: Validate decode performance gains with real workloads
+
+## 14. Performance Analysis (Theoretical)
+
+Since the `TILE_M=64` kernel currently falls back to 128 due to compilation issues, we cannot measure actual GPU time reduction yet. However, we have validated the selection logic and calculated the theoretical work reduction:
+
+| Scenario | Logical Rows | Computed Rows (M=128) | Computed Rows (M=64) | Work Reduction |
+|----------|--------------|-----------------------|----------------------|----------------|
+| **1 Token Decode** | 8 | 1024 | 512 | **50%** |
+| **8 Tokens Decode** | 64 | 8192 | 4096 | **50%** |
+| **Skewed (64 tok)** | 512 | 13696 | 7040 | **48.6%** |
+
+The Python-side selection logic correctly picks `TILE_M=64` for <= 64 tokens, ensuring that once the kernel compilation is fixed, these savings will be realized automatically.
+
+## 16. CUTLASS Framework Patches for N < 128 Support (2026-01-15)
+
+### 16.1 Root Cause Analysis
+
+The original CUTLASS SM120 block-scaled grouped GEMM code did not support N < 128 due to scale factor TMA descriptor requirements. This was a **framework limitation**, not a hardware limitation.
+
+**Key difference from SM100:**
+- SM100's `sm100_blockscaled_mma_warpspecialized.hpp` has explicit `IsCtaN64` handling
+- SM120's `sm120_blockscaled_mma_array_tma.hpp` (grouped GEMM) lacked this handling
+
+### 16.2 Patches Applied
+
+**File 1: `cutlass/include/cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp`**
+
+1. Added `TileN_SFB` with ceil_div to pad N to 128:
+```cpp
+using Blk_MN = typename Sm1xxBlkScaledConfig::Blk_MN;  // = 128
+static constexpr int TileN_SFB = cutlass::ceil_div(cute::size<1>(TileShape{}), Blk_MN{}) * Blk_MN{};
+using TileShape_SFB = decltype(cute::make_shape(cute::Int<TileN_SFB>{}, cute::size<2>(TileShape{})));
+```
+
+2. Added `IsCtaN64` flag:
+```cpp
+static constexpr bool IsCtaN64 = cute::size<1>(TileShape{}) == 64;
+```
+
+3. Updated TMA_SFB type to use `TileShape_SFB{}` instead of `make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}))`
+
+4. Made MMA assertion conditional:
+```cpp
+if constexpr (!IsCtaN64) { CUTE_STATIC_ASSERT_V(size<1>(tCrSFB) == size<2>(accum)); }
+```
+
+**File 2: `cutlass/include/cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl`**
+
+Applied same ceil_div logic for SmemLayoutSFB:
+```cpp
+static constexpr int TileN_SFB = cutlass::ceil_div(cute::size<1>(TileShape_MNK{}), Blk_MN{}) * Blk_MN{};
+using sSFB_shapeN = decltype(prepend(Int<TileN_SFB>{} / Blk_MN{}, mnBasicBlockShape{}));
+using sSFB_strideK = decltype(prepend(make_stride(Int<MMA_NSF>{}, Int<TileN_SFB>{} / Blk_MN{} * Blk_Elems{}), kBasicBlockStride{}));
+```
+
+### 16.3 Verified Tile Configurations
+
+All three configurations now compile successfully:
+| Tile (M, N) | SWAP_AB | Physical Tile | Use Case |
+|-------------|---------|---------------|----------|
+| (128, 128)  | 0       | (128, 128)    | Prefill  |
+| (128, 64)   | 0       | (128, 64)     | Smaller K |
+| (64, 128)   | 1       | (128, 64)     | Decode (small M) |
+
+### 16.4 Next Steps
+
+1. Runtime testing to verify correctness
+2. Performance benchmarking with different tile sizes
+3. Consider upstreaming patches to CUTLASS
+
+---
+
+## 17. M=64 Native Hardware Support (2026-01-15)
+
+### 17.1 Discovery
+
+Investigation revealed that the `tcgen05.mma` hardware instruction **natively supports M=64**. The constraint was not in the hardware but in the CUTLASS framework's scale factor layout computation.
+
+From `cute/arch/mma_sm100_umma.hpp`:
+```cpp
+static_assert(M == 64 || M == 128, "SM100_MMA_TF32 M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
+```
+
+And from the descriptor encoding (`mma_sm100_desc.hpp`):
+```cpp
+m_dim_: 5,  // bit [24,29) : 4 LSBs not included. Valid values are: 4 (M=64), 8 (M=128), 16 (M=256)
+```
+
+### 17.2 CUTLASS Framework Patches for M < 128
+
+The same issue that affected N < 128 (see Section 16) also affects M < 128. Applied the same fix:
+
+**File: `sm120_blockscaled_mma_builder.inl`**
+```cpp
+// M dimension must be rounded up to at least Blk_MN (128) for TMA and UTCCP to work.
+// This matches the ceil_div logic in Sm1xxBlockScaledConfig::deduce_smem_layoutSFA.
+static constexpr int TileM_SFA = cutlass::ceil_div(cute::size<0>(TileShape_MNK{}), Blk_MN{}) * Blk_MN{};
+using sSFA_shapeM  = decltype(prepend(Int<TileM_SFA>{} / Blk_MN{}, mnBasicBlockShape{}));
+using sSFA_strideK = decltype(prepend(make_stride(Int<MMA_NSF>{}, Int<TileM_SFA>{} / Blk_MN{} * Blk_Elems{}), kBasicBlockStride{}));
+```
+
+**File: `sm120_blockscaled_mma_array_tma.hpp`**
+```cpp
+// Scale factor A tile shape - M dimension padded to at least 128 for TMA
+static constexpr int TileM_SFA = cutlass::ceil_div(cute::size<0>(TileShape{}), Blk_MN{}) * Blk_MN{};
+using TileShape_SFA = decltype(cute::make_shape(cute::Int<TileM_SFA>{}, cute::size<2>(TileShape{})));
+static constexpr bool IsCtaM64 = cute::size<0>(TileShape{}) == 64;
+
+// Use TileShape_SFA for TMA_SFA descriptor creation
+using TMA_SFA = decltype(make_tma_copy<uint16_t>(..., TileShape_SFA{}, ...));
+
+// Skip size assertion for padded M=64 case
+if constexpr (!IsCtaM64) { CUTE_STATIC_ASSERT_V(size<1>(tCrSFA) == size<1>(accum)); }
+```
+
+### 17.3 Eliminating SWAP_AB
+
+With M=64 natively supported, the `SWAP_AB` (transposed mode) hack is no longer needed:
+
+**File: `flashinfer/jit/fused_moe.py`**
+```python
+# swap_ab (transposed mode) is no longer needed.
+# The tcgen05 hardware supports M=64 directly, and we've patched CUTLASS to handle
+# the scale factor layout padding for M < 128.
+swap_ab = False
+```
+
+### 17.4 Verified Tile Configurations
+
+All combinations now compile successfully:
+
+| Tile (M, N) | Scale Factor Padding | Notes |
+|-------------|---------------------|-------|
+| (128, 128) | None | Standard, default |
+| (128, 64) | SFB padded | Smaller N |
+| (64, 128) | SFA padded | Smaller M (decode) |
+| (64, 64) | Both padded | Smallest tile |
+
+### 17.5 Benefits
+
+1. **Simpler code**: No transposed/swap logic complexity
+2. **Fewer kernel variants**: Single code path for all M sizes
+3. **Native efficiency**: Hardware directly supports M=64 without layout transformations
+4. **Expanded tile selection**: More options for autotuning
+
+---
+
+## 18. References
+
+### Internal
 - **FlashInfer GEMM layout:** `csrc/nv_internal/.../moe_gemm_kernels.h` (line 53-55)
 - **FlashInfer MoE JIT:** `flashinfer/jit/fused_moe.py` (`gen_cutlass_fused_moe_module`)
 - **TRT-LLM tile configs:** `trtllmGen_bmm_export/config.json`
@@ -797,3 +1082,7 @@ token_selected_experts[:, :] = 0  # Expert 0 gets everything
 - **FlashInfer JIT system:** `flashinfer/jit/`
 - **FlashInfer autotuner:** `flashinfer/autotuner.py`
 - **Current launcher:** `moe_gemm_sm120_mixed_input_launcher.inl`
+
+### External PRs (M/N Swap Solution)
+- **FlashInfer PR 2327:** [M/N swap for small-M decode](https://github.com/flashinfer-ai/flashinfer/pull/2327) - Core solution for tcgen05 M≥64 constraint
+- **CUTLASS PR 2946:** [N not divisible by 64 handling](https://github.com/NVIDIA/cutlass/pull/2946) - Required after M/N swap for proper epilogue
