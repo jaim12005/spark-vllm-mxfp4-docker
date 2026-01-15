@@ -54,14 +54,18 @@ def test_tile_compile(tile_mn: tuple[int, int]) -> bool:
 
 def main():
     # Test configurations in order
-    # SM120 MXFP4 TMA constraints: M >= 64, N >= 32 (padded to 128 internally for SF)
+    # SM120 MXFP4 constraints:
+    #   - M >= 64, multiple of 64 (tcgen05 hardware minimum)
+    #   - N >= 32, multiple of 32 (smem copy atom minimum)
+    # Both M < 128 and N < 128 are padded to 128 internally for scale factor layouts
+    # Note: N=16 and N=8 fail due to TiledCopy atom size constraints
     configs = [
         (128, 128),  # Standard: 128x128 (default)
-        (128, 64),   # Standard: 128x64 (smaller N)
-        (128, 32),   # Standard: 128x32 (smallest N per CUTLASS builder)
-        (64, 128),   # M=64 (tests TileShape_SFA padding)
-        (64, 64),    # Both M and N small
-        (64, 32),    # Smallest practical tile for decode
+        (128, 64),   # Standard: 128x64
+        (128, 32),   # Standard: 128x32 (smallest N)
+        (64, 128),   # M=64: 64x128
+        (64, 64),    # M=64: 64x64
+        (64, 32),    # M=64: 64x32 (smallest tile)
     ]
     
     results = {}
