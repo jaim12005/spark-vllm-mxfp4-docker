@@ -1314,9 +1314,233 @@ This allocates 2× the FP4 payload size in SMEM, but:
 
 ---
 
-## 20. References
+## 20. Two FP4 Instruction Paths on SM121f (2026-01-15)
 
-### 20.1 Internal
+### 20.1 Discovery
+
+Investigation revealed that SM121f (GB10) has **two distinct instruction paths** for FP4 operations, with different shared memory requirements:
+
+| Path | PTX Instruction | Operand Types | K dim | SMEM Format |
+|------|-----------------|---------------|-------|-------------|
+| **`kind::f8f6f4`** | `mma.sync.aligned.kind::f8f6f4.m16n8k32` | Mixed (e.g., FP8×FP4) | 32 | **Padded** (`_p64`) |
+| **`kind::mxf4`** | `mma.sync.aligned.kind::mxf4.block_scale.m16n8k64` | FP4×FP4 only | 64 | **Packed** (no padding) |
+
+### 20.2 The Packed FP4 Path (`kind::mxf4`)
+
+The `kind::mxf4` instruction path:
+- Uses standard `SM75_U32x4_LDSM_N` ldmatrix (no `_p64` suffix)
+- Both operands must be FP4 (e2m1)
+- K dimension is 64 (vs 32 for `kind::f8f6f4`)
+- **No padding required** - true 0.5 bytes/element SMEM usage
+
+This was verified to compile and run on SM121f:
+```cpp
+// Works: kind::mxf4 with packed FP4 from registers
+asm volatile(
+    "mma.sync.aligned.m16n8k64.row.col.kind::mxf4.block_scale.scale_vec::2X.f32.e2m1.e2m1.f32.ue8m0 "
+    "{%0, %1, %2, %3}, "
+    "{%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, "
+    "%14, {%15, %16}, %17, {%18, %19};\n"
+    ...
+);
+```
+
+### 20.3 Why We Use `kind::f8f6f4` (Padded Path)
+
+Our use case is **FP8 activations × FP4 weights** (MXFP4):
+- A operand: FP8 (e4m3) from `mxfp8_quantize(hidden_states)`
+- B operand: FP4 (e2m1) from pre-quantized model weights
+
+The `kind::mxf4` path requires **both operands to be FP4**:
+```cpp
+// Fails: kind::mxf4 rejects mixed types
+"mma.sync.aligned.m16n8k64.row.col.kind::mxf4.block_scale...f32.e4m3.e2m1.f32..."
+// Error: Incorrect instruction type specified for mma with shape '.m16n8k64'
+```
+
+Therefore, we must use `kind::f8f6f4` which mandates the padded SMEM format.
+
+### 20.4 Trade-off: Packed FP4 Path
+
+If we were willing to change to **FP4×FP4**:
+- Quantize FP8 activations → FP4 (additional quantization step)
+- Use `kind::mxf4` with packed SMEM
+- **Benefit**: 50% SMEM reduction for both A and B operands
+- **Cost**: Potential accuracy degradation from FP8→FP4 quantization
+
+This is a **future optimization opportunity** if:
+1. Accuracy testing shows FP4 activations are acceptable
+2. The SMEM savings enable larger tiles or more pipeline stages
+3. The K=64 instruction provides better throughput
+
+### 20.5 CUTLASS Support
+
+CUTLASS has MMA traits for `kind::mxf4` on SM120:
+```cpp
+// cute/atom/mma_traits_sm120.hpp
+struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<a_type, b_type, c_type, sf_type, VS>>
+{
+  using ValTypeA = uint4_t;  // Native 4-bit
+  using ValTypeB = uint4_t;  // Native 4-bit
+  using Shape_MNK = Shape<_16,_8,_64>;
+  ...
+};
+```
+
+When `UseMxf8f6f4 = false`, the builder uses:
+- `SmemCopyTypeB = TiledMma::ValTypeB` (uint4_t, not uint8_t)
+- Standard `SM75_U32x4_LDSM_N` ldmatrix (no `_p64` padding)
+
+### 20.6 Verification Scripts
+
+The following were used to verify instruction availability:
+
+```bash
+# Test kind::mxf4 compilation and runtime
+docker exec vllm-dev nvcc -gencode arch=compute_121f,code=sm_121f test_mxf4.cu
+
+# Verify macros enabled
+# CUTE_ARCH_MXF4NVF4_2X_UE8M0_MMA_ENABLED: YES
+# CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED: YES
+```
+
+### 20.7 Summary
+
+| Question | Answer |
+|----------|--------|
+| Is there a packed FP4 path on SM121f? | **Yes** - `kind::mxf4` |
+| Can we use it for FP8×FP4? | **No** - requires FP4×FP4 |
+| Is the `uint8` padding a bug? | **No** - mandated by `kind::f8f6f4` |
+| Could we switch to FP4×FP4? | **Maybe** - accuracy trade-off |
+
+---
+
+## 21. Empty Expert Handling (M=0) - Bug Fix (2026-01-16)
+
+### 21.1 Problem
+
+When some experts receive 0 tokens (common in MoE routing), the grouped GEMM crashed with "illegal instruction" or "illegal memory access" errors.
+
+**Root Cause:** The code was artificially setting `gemm_m_for_problem = 128` for empty experts (M=0) to satisfy a perceived block-scale alignment requirement:
+
+```cpp
+// INCORRECT - causes stride/shape mismatch
+constexpr int64_t kBlockScaleAlignment = 128;
+auto const gemm_m_for_problem = (has_block_scale_fc1 || has_block_scale_fc2) && gemm_m == 0
+    ? kBlockScaleAlignment : gemm_m;  // This sets M=128 for empty experts
+```
+
+However, the strides and pointers were still computed using the real `gemm_m = 0`. This mismatch caused the kernel to try to access 128 rows of data while the memory layout was configured for 0 rows.
+
+### 21.2 Solution
+
+Use the actual `gemm_m` value directly, including M=0 for empty experts. CUTLASS grouped GEMM properly handles groups with M=0 by skipping them during execution.
+
+```cpp
+// CORRECT - CUTLASS skips groups with M=0
+auto const gemm_m_for_problem = gemm_m;
+```
+
+### 21.3 Changed File
+
+`csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh` around line 1290
+
+### 21.4 Testing
+
+Verified with:
+- 1 expert (M=2): Pass
+- 2 experts (each with 1 token): Pass
+- 8 experts (only 1 active, others M=0): **Now passes** (previously crashed)
+- 128 experts (gpt-oss-120b dimensions): Pass
+
+---
+
+## 22. Known Issue: Duplicate Expert Selection Crash (2026-01-16)
+
+### 22.1 Problem
+
+The SM120 MXFP4 CUTLASS kernel crashes with "illegal memory access" when a token selects the **same expert multiple times** within its top-k selection.
+
+**Root Cause:** The `finalizeMoeRoutingKernel` reads from `unpermuted_row_to_permuted_row` which contains garbage values when duplicate experts are selected. The fused prologue kernel's radix sort ranking algorithm doesn't correctly handle duplicate expert IDs for the same token.
+
+**Symptoms:**
+- Kernel reports "initialize succeeded, calling run()..." (GEMM succeeds)
+- `finalizeMoeRoutingKernel` crashes with "invalid __global__ read"
+- Access is ~96GB out of bounds (garbage pointer value in permutation map)
+
+**Reproducer:**
+```python
+# FAILS - token 3 selects expert 74 twice
+topk_ids = torch.zeros((256, 4), dtype=torch.int32, device='cuda')
+topk_ids[3] = torch.tensor([74, 74, 87, 116])  # Duplicate expert 74
+
+# PASSES - all distinct experts per token  
+topk_ids[i] = torch.tensor([i*4, i*4+1, i*4+2, i*4+3])
+```
+
+### 22.2 Analysis
+
+With seed 42 random routing for 256 tokens with top-4:
+- **14 out of 256 tokens** have duplicate expert selections
+- Example duplicates:
+  - Token 3: [74, 74, 87, 116] - expert 74 selected twice
+  - Token 12: [61, 61, 46, 61] - expert 61 selected THREE times
+
+### 22.3 Affected Scenarios
+
+| Scenario | Result |
+|----------|--------|
+| All tokens select distinct experts per top-k | **PASS** |
+| Uniform/deterministic routing (no duplicates) | **PASS** |
+| Random routing (may have duplicates) | **FAIL** |
+| vLLM inference (learned gating may have duplicates) | **FAIL** |
+
+### 22.4 Fix Options
+
+**Option A: Input Validation (Quick)**
+Add check in Python wrapper to reject/deduplicate expert selections before calling kernel.
+
+**Option B: Kernel Fix (Proper)**
+Modify `fusedBuildExpertMapsSortFirstTokenKernel` to handle duplicate expert IDs by assigning distinct permuted indices even for same-expert selections.
+
+**Option C: Use Unfused Prologue**
+Force fallback to `threeStepBuildExpertMapsSortFirstToken` which may handle duplicates correctly.
+
+### 22.5 Workaround
+
+Use MARLIN backend which dequantizes weights to BF16 and uses standard GEMM:
+
+```bash
+export VLLM_MXFP4_BACKEND=MARLIN
+vllm serve openai/gpt-oss-120b --quantization mxfp4 ...
+```
+
+The MARLIN backend works correctly but may have lower throughput than native FP4 compute.
+
+### 22.6 Additional Issue: CUDA Graph Capture Crash
+
+**Update (2026-01-16):** vLLM's actual gating uses `torch.topk` which ALWAYS returns distinct indices. The duplicate expert issue only affects test code using `torch.randint`.
+
+A separate issue exists during CUDA graph capture:
+- CUTLASS kernel runs successfully during initial warmup (many "initialize succeeded" messages)
+- Crashes with "illegal instruction" during CUDA graph capture phase
+- `--enforce-eager` bypasses CUDA graphs but issue persists during actual inference
+
+This suggests a deeper issue with kernel execution under certain conditions, possibly related to batch size, memory layout, or SM121 instruction support.
+
+### 22.7 Status
+
+- **Priority:** HIGH (blocks native CUTLASS path for real inference)
+- **Root Causes:**
+  1. Duplicate expert selection bug (test-only, doesn't affect vLLM gating)
+  2. CUDA graph capture crash (under investigation)
+- **Fallback:** MARLIN backend available (~33 tok/s decode)
+
+---
+
+## 23. References
+
+### 23.1 Internal
 - **FlashInfer GEMM layout:** `csrc/nv_internal/.../moe_gemm_kernels.h` (line 53-55)
 - **FlashInfer MoE JIT:** `flashinfer/jit/fused_moe.py` (`gen_cutlass_fused_moe_module`)
 - **TRT-LLM tile configs:** `trtllmGen_bmm_export/config.json`
@@ -1326,6 +1550,6 @@ This allocates 2× the FP4 payload size in SMEM, but:
 - **FlashInfer autotuner:** `flashinfer/autotuner.py`
 - **Current launcher:** `moe_gemm_sm120_mixed_input_launcher.inl`
 
-### 20.2 External PRs (M/N Swap Solution)
+### 23.2 External PRs (M/N Swap Solution)
 - **FlashInfer PR 2327:** [M/N swap for small-M decode](https://github.com/flashinfer-ai/flashinfer/pull/2327) - Core solution for tcgen05 M≥64 constraint
 - **CUTLASS PR 2946:** [N not divisible by 64 handling](https://github.com/NVIDIA/cutlass/pull/2946) - Required after M/N swap for proper epilogue

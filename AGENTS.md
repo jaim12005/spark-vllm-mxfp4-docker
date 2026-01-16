@@ -205,23 +205,35 @@ docker exec vllm-dev python3 -c "import flashinfer; print(flashinfer.__file__)"
 
 ## vLLM Server Configuration
 
-### Current Dev Command
+### Current Best Command
 
 ```bash
+docker exec -it vllm-dev bash -c '
+export PYTHONPATH=/workspace/flashinfer:/workspace/vllm
 vllm serve openai/gpt-oss-120b \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --served-model-name gpt-oss-120b \
-    --quantization mxfp4 \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.70 \
-    --max-model-len 131072 \
-    --max-num-seqs 2 \
-    --max-num-batched-tokens 8192 \
-    --enforce-eager \
-    --enable-prefix-caching \
-    --load-format fastsafetensors
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name gpt-oss-120b \
+  --quantization mxfp4 \
+  --mxfp4-backend CUTLASS \
+  --mxfp4-layers moe,qkv,o,lm_head \
+  --attention-backend FLASHINFER \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.70 \
+  --max-model-len 131072 \
+  --max-num-seqs 2 \
+  --max-num-batched-tokens 8192 \
+  --enable-prefix-caching \
+  --load-format fastsafetensors
+'
 ```
+
+**Key flags:**
+- `--mxfp4-layers moe,qkv,o,lm_head` - Quantize all layers (MoE, attention, LM head)
+- `--attention-backend FLASHINFER` - Use FlashInfer for attention
+- `--kv-cache-dtype fp8` - FP8 KV cache for memory efficiency
+- No `--enforce-eager` - Enable CUDA graphs for better decode perf
 
 ### Key Environment Variables
 

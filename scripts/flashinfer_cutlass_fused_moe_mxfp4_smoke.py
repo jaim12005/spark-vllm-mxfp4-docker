@@ -6,15 +6,20 @@ def align_to(x: int, a: int) -> int:
 
 
 def main() -> None:
-    # We intentionally keep this tiny; we only need to exercise CUTLASS runner init + SF layouts.
+    import sys
+    
     device = "cuda"
-    num_tokens = 2
     num_experts = 1
     topk = 1
 
-    # Must satisfy MXFP4 path checks (divisible by 128).
-    hidden_size = 256
-    inter_size = 256
+    # gpt-oss-120b dimensions: 2880 must be padded to 2944 (next multiple of 128)
+    # TMA's 16U4 format for FP4 data requires K dimension aligned to 64 bytes = 128 elements
+    # This padding MUST happen before calling the kernel (in vLLM or FlashInfer layer)
+    hidden_size = 2944  # round_up(2880, 128)
+    inter_size = 2944
+    
+    # Allow testing with different token counts via command line
+    num_tokens = int(sys.argv[1]) if len(sys.argv) > 1 else 66
 
     # FP8 activations (required for MXFP4 path)
     x = torch.randn((num_tokens, hidden_size), device=device, dtype=torch.float16).to(
