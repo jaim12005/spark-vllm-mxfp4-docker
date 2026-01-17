@@ -13,7 +13,9 @@
 # Benchmark:
 #   docker compose exec vllm-mxfp4 llama-benchy \
 #       --base-url http://localhost:8000/v1 \
-#       --model gpt-oss-120b --pp 2048 --tg 32 128
+#       --model gpt-oss-120b \
+#       --tokenizer openai/gpt-oss-120b \
+#       --pp 2048 --tg 32 128
 #
 # =============================================================================
 

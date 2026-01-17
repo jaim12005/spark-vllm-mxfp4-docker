@@ -437,11 +437,12 @@ rm -rf ~/.cache/vllm/*
 
 ```bash
 llama-benchy \
+  --base-url http://localhost:8000/v1 \
   --model gpt-oss-120b \
-  --endpoint http://localhost:8000 \
-  --prompt-length 2048 \
-  --output-lengths 32,128 \
-  --num-requests 10
+  --tokenizer openai/gpt-oss-120b \
+  --pp 2048 \
+  --tg 32 128 \
+  --runs 5
 ```
 
 ---
