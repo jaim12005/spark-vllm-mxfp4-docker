@@ -121,6 +121,22 @@ docker compose -f docker-compose.dev.yml exec dev bash
 
 ---
 
+## Build Cache
+
+The Dockerfile uses Docker BuildKit cache mounts to speed up rebuilds:
+- **uv-cache**: Python package cache
+- **ccache**: C++/CUDA compilation cache
+
+First build takes 30-60+ minutes. Subsequent builds are much faster.
+
+To clear the build cache (forces full rebuild):
+
+```bash
+docker builder prune --filter type=exec.cachemount
+```
+
+---
+
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) - Project context and AI assistant guide
