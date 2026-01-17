@@ -168,6 +168,11 @@ docker builder prune --filter type=exec.cachemount
 **New Features**
 - Speculative decoding with Eagle3 tree-based verification
 - Support for multiple quantization modes: native BF16, MXFP8, MXFP4
+- NVFP4 format support (group size 16, vs MXFP4's group size 32)
+- LoRA adapter support
+
+**Numerical Accuracy**
+- Full-scale activation quantization (currently using identity scales for simplicity)
 
 ---
 
