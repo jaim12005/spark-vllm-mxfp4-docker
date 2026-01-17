@@ -182,6 +182,12 @@ docker builder prune --filter type=exec.cachemount
 - [docs/reference/](docs/reference/) - Technical deep dive (SM121 architecture, CUTLASS details)
 - [docs/porting/](docs/porting/) - Feature implementation documentation
 
+### Competitor Analysis
+
+- [SGLang Analysis](docs/analysis/SGLANG_ANALYSIS.md) - How SGLang achieves 52 tok/s
+- [llama.cpp Analysis](docs/analysis/LLAMA_CPP_ANALYSIS.md) - How llama.cpp achieves 58 tok/s
+- [vLLM Baseline Analysis](docs/analysis/VLLM_BASELINE_ANALYSIS.md) - Why vLLM started at 29 tok/s
+
 ---
 
 ## Pinned Versions
