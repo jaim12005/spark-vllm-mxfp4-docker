@@ -98,23 +98,54 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Clone repositories at pinned versions
 # =============================================================================
 
-# Clone FlashInfer
-RUN git clone ${FLASHINFER_REPO} /workspace/flashinfer && \
-    cd /workspace/flashinfer && \
-    git checkout ${FLASHINFER_SHA}
+# Clone FlashInfer (cached for faster rebuilds)
+RUN --mount=type=cache,id=git-flashinfer,target=/git-cache/flashinfer \
+    if [ -d /git-cache/flashinfer/.git ]; then \
+        echo "=== Using cached FlashInfer repo ===" && \
+        cp -a /git-cache/flashinfer /workspace/flashinfer && \
+        cd /workspace/flashinfer && \
+        git fetch origin; \
+    else \
+        echo "=== Cloning FlashInfer (first build) ===" && \
+        git clone ${FLASHINFER_REPO} /workspace/flashinfer && \
+        cp -a /workspace/flashinfer /git-cache/flashinfer; \
+    fi && \
+    cd /workspace/flashinfer && git checkout ${FLASHINFER_SHA}
 
-# Update CUTLASS submodule to our fork
+# Clone spdlog submodule (small, no caching needed)
 RUN cd /workspace/flashinfer && \
-    git submodule update --init --recursive && \
-    cd 3rdparty/cutlass && \
-    git remote set-url origin ${CUTLASS_REPO} && \
-    git fetch origin && \
-    git checkout ${CUTLASS_SHA}
+    git submodule update --init 3rdparty/spdlog
 
-# Clone vLLM
-RUN git clone ${VLLM_REPO} /workspace/vllm && \
-    cd /workspace/vllm && \
-    git checkout ${VLLM_SHA} && \
+# Clone CUTLASS directly (skip submodule, use our fork)
+RUN --mount=type=cache,id=git-cutlass,target=/git-cache/cutlass \
+    cd /workspace/flashinfer && \
+    rm -rf 3rdparty/cutlass && \
+    if [ -d /git-cache/cutlass/.git ] && [ -d /git-cache/cutlass/.git/objects ]; then \
+        echo "=== Using cached CUTLASS repo ===" && \
+        cp -a /git-cache/cutlass 3rdparty/cutlass && \
+        cd 3rdparty/cutlass && \
+        git fetch origin; \
+    else \
+        echo "=== Cloning CUTLASS (first build) ===" && \
+        rm -rf /git-cache/cutlass/* /git-cache/cutlass/.* 2>/dev/null || true && \
+        git clone ${CUTLASS_REPO} 3rdparty/cutlass && \
+        cp -a /workspace/flashinfer/3rdparty/cutlass/. /git-cache/cutlass/; \
+    fi && \
+    cd /workspace/flashinfer/3rdparty/cutlass && git checkout ${CUTLASS_SHA}
+
+# Clone vLLM (cached for faster rebuilds)
+RUN --mount=type=cache,id=git-vllm,target=/git-cache/vllm \
+    if [ -d /git-cache/vllm/.git ]; then \
+        echo "=== Using cached vLLM repo ===" && \
+        cp -a /git-cache/vllm /workspace/vllm && \
+        cd /workspace/vllm && \
+        git fetch origin; \
+    else \
+        echo "=== Cloning vLLM (first build) ===" && \
+        git clone ${VLLM_REPO} /workspace/vllm && \
+        cp -a /workspace/vllm /git-cache/vllm; \
+    fi && \
+    cd /workspace/vllm && git checkout ${VLLM_SHA} && \
     git submodule update --init --recursive
 
 # =============================================================================
@@ -159,14 +190,22 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install fastsafetensors llama-benchy
 
 # =============================================================================
-# Download tiktoken encodings
+# Download tiktoken encodings (cached)
 # =============================================================================
 
-RUN mkdir -p /workspace/tiktoken_encodings && \
-    wget -q -O /workspace/tiktoken_encodings/o200k_base.tiktoken \
-        "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" && \
-    wget -q -O /workspace/tiktoken_encodings/cl100k_base.tiktoken \
-        "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+RUN --mount=type=cache,id=tiktoken-cache,target=/tiktoken-cache \
+    mkdir -p /workspace/tiktoken_encodings && \
+    if [ -f "/tiktoken-cache/o200k_base.tiktoken" ] && [ -f "/tiktoken-cache/cl100k_base.tiktoken" ]; then \
+        echo "=== Using cached tiktoken encodings ===" && \
+        cp /tiktoken-cache/*.tiktoken /workspace/tiktoken_encodings/; \
+    else \
+        echo "=== Downloading tiktoken encodings ===" && \
+        wget -q -O /tiktoken-cache/o200k_base.tiktoken \
+            "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" && \
+        wget -q -O /tiktoken-cache/cl100k_base.tiktoken \
+            "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken" && \
+        cp /tiktoken-cache/*.tiktoken /workspace/tiktoken_encodings/; \
+    fi
 
 # =============================================================================
 # Create entrypoint script (validation only)
@@ -194,6 +233,21 @@ cc = torch.cuda.get_device_capability()
 print(f'Compute Capability: SM{cc[0]}{cc[1]}')
 "
 
+# Check if model is downloaded
+MODEL_PATH="/root/.cache/huggingface/hub/models--openai--gpt-oss-120b"
+if [ ! -d "$MODEL_PATH" ]; then
+    echo ""
+    echo "WARNING: Model not found at $MODEL_PATH"
+    echo ""
+    echo "Download the model first (240GB):"
+    echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
+    echo "  uv tool install huggingface_hub"
+    echo "  hf download openai/gpt-oss-120b"
+    echo ""
+    echo "Or vLLM will attempt to download it (slow)."
+    echo ""
+fi
+
 echo ""
 echo "=============================================="
 echo ""
@@ -209,7 +263,7 @@ RUN chmod +x /workspace/entrypoint.sh
 
 WORKDIR /workspace
 
-RUN mkdir -p ${HF_HOME} ${TRANSFORMERS_CACHE}
+RUN mkdir -p ${HF_HOME}
 
 EXPOSE 8000
 

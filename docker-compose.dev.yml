@@ -21,7 +21,13 @@ services:
     container_name: vllm-dev
     
     # GPU access
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ipc: host
     
     # Keep container running for interactive use
@@ -60,8 +66,6 @@ services:
     # Environment variables
     environment:
       # CRITICAL: Required for FlashInfer CUTLASS MoE to work with editable install
-      # This sets PYTHONPATH to include both repos. The ${PYTHONPATH:+:$PYTHONPATH} suffix
-      # preserves any existing PYTHONPATH from the image (requires modern docker compose).
       - PYTHONPATH=/workspace/flashinfer:/workspace/vllm
       
       # Tiktoken encodings for tokenizer
@@ -92,7 +96,13 @@ services:
     image: vllm-dev:latest
     container_name: vllm-serve
     
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ipc: host
     
     ulimits:

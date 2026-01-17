@@ -159,15 +159,20 @@ docker compose -f docker-compose.dev.yml exec dev bash
 ## Build Cache
 
 The Dockerfile uses Docker BuildKit cache mounts to speed up rebuilds:
+- **git-flashinfer, git-vllm, git-cutlass**: Git repo caches
 - **uv-cache**: Python package cache
 - **ccache**: C++/CUDA compilation cache
 
-First build takes 30-60+ minutes. Subsequent builds are much faster.
+First build takes ~30 minutes. Subsequent builds are much faster.
 
-To clear the build cache (forces full rebuild):
+To clear caches:
 
 ```bash
+# Clear Docker BuildKit caches (git repos, ccache, pip)
 docker builder prune --filter type=exec.cachemount
+
+# Clear FlashInfer JIT cache (volume mount)
+sudo rm -rf .cache/
 ```
 
 ---
