@@ -115,6 +115,14 @@ See `docker-compose.yml` for full configuration.
 For development with local FlashInfer/vLLM repos:
 
 ```bash
+# Clone the repos (one-time setup)
+mkdir -p ~/projects && cd ~/projects
+git clone -b mxfp4_v2 https://github.com/christopherowen/vllm.git
+git clone -b mxfp4_v2 https://github.com/christopherowen/flashinfer.git
+cd flashinfer && git submodule update --init --recursive
+
+# Start development container
+cd ~/projects/ai/mxfp4
 docker compose -f docker-compose.dev.yml up -d
 docker compose -f docker-compose.dev.yml exec dev bash
 ```
