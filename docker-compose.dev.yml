@@ -62,7 +62,7 @@ services:
       # CRITICAL: Required for FlashInfer CUTLASS MoE to work with editable install
       # This sets PYTHONPATH to include both repos. The ${PYTHONPATH:+:$PYTHONPATH} suffix
       # preserves any existing PYTHONPATH from the image (requires modern docker compose).
-      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
+      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm
       
       # Tiktoken encodings for tokenizer
       - TIKTOKEN_ENCODINGS_BASE=/workspace/tiktoken_encodings
@@ -115,7 +115,7 @@ services:
     
     environment:
       # CRITICAL: Required for FlashInfer CUTLASS MoE to work with editable install
-      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm${PYTHONPATH:+:$PYTHONPATH}
+      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm
       - TIKTOKEN_ENCODINGS_BASE=/workspace/tiktoken_encodings
       
       # NOTE: Add vLLM runtime configuration here when needed
