@@ -32,7 +32,9 @@ See the [discussion on NVIDIA Developer Forums](https://forums.developer.nvidia.
 
 ### SM120/SM121 MXFP4 MoE Kernel
 - **First implementation** of CUTLASS block-scaled MXFP4 MoE GEMM for DGX Spark (GB10)
-- Automatic tile selection optimized for decode (64×128) and prefill (128×128+)
+- Automatic tile and schedule selection:
+  - **Decode**: 64×128 tiles with PingPong schedule (double-buffered, better for small batches)
+  - **Prefill**: 128×128 tiles with Cooperative schedule (warps share tiles, better for large batches)
 - CUTLASS patches enabling small-tile compilation (previously broken)
 - 2x decode throughput improvement over baseline
 
@@ -215,7 +217,7 @@ sudo rm -rf .cache/
 - Work with NVIDIA on CUTLASS Blackwell block-scaled improvements
 
 **Performance Optimizations**
-- Use FlashInfer autotuner to dynamically select optimal tile shapes based on workload ([plan](docs/plans/SMALL_TILE_SUPPORT_PLAN.md))
+- Use FlashInfer autotuner to dynamically select optimal tile shapes and CUTLASS schedules (PingPong vs Cooperative) based on workload ([plan](docs/plans/SMALL_TILE_SUPPORT_PLAN.md))
 - Benchmark additional tile shapes (64×64, 64×256, 128×64) for different workload sizes
 - Benchmark small-M tiles (M=8, 16, 32) and small-N tiles for decode-oriented workloads
 - Fuse activation quantization directly into MoE GEMM kernel ([plan](docs/plans/SM121_MOE_FUSE_BF16_TO_FP8_EXPAND_PLAN.md))
