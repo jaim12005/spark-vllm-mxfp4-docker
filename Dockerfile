@@ -7,10 +7,14 @@
 # Build:
 #   docker build -t vllm-mxfp4-spark .
 #
-# Run (with model cache):
+# Run with docker-compose (recommended):
+#   docker compose up -d
+#
+# Run standalone:
 #   docker run --gpus all -p 8000:8000 \
 #       -v ~/.cache/huggingface:/root/.cache/huggingface \
-#       vllm-mxfp4-spark
+#       vllm-mxfp4-spark \
+#       vllm serve openai/gpt-oss-120b --quantization mxfp4
 #
 # =============================================================================
 
@@ -69,6 +73,9 @@ ENV TORCH_CUDA_ARCH_LIST="12.1"
 # Model cache
 ENV HF_HOME=/root/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/root/.cache/huggingface/transformers
+
+# Use local repos
+ENV PYTHONPATH=/workspace/flashinfer:/workspace/vllm
 
 WORKDIR /workspace
 
@@ -157,21 +164,21 @@ RUN mkdir -p /workspace/tiktoken_encodings && \
         "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 
 # =============================================================================
-# Create startup script
+# Create entrypoint script (validation only)
 # =============================================================================
 
-RUN cat > /workspace/start.sh << 'STARTSCRIPT'
+RUN cat > /workspace/entrypoint.sh << 'ENTRYPOINT_SCRIPT'
 #!/bin/bash
 set -e
 
 echo "=============================================="
-echo "MXFP4 vLLM Server for DGX Spark (SM121/GB10)"
+echo "MXFP4 vLLM for DGX Spark (SM121/GB10)"
 echo "=============================================="
 echo ""
 echo "Git SHAs:"
-echo "  vLLM:      $(cd /workspace/vllm && git rev-parse --short HEAD)"
+echo "  vLLM:       $(cd /workspace/vllm && git rev-parse --short HEAD)"
 echo "  FlashInfer: $(cd /workspace/flashinfer && git rev-parse --short HEAD)"
-echo "  CUTLASS:   $(cd /workspace/flashinfer/3rdparty/cutlass && git rev-parse --short HEAD)"
+echo "  CUTLASS:    $(cd /workspace/flashinfer/3rdparty/cutlass && git rev-parse --short HEAD)"
 echo ""
 
 # Validate GPU
@@ -183,36 +190,13 @@ print(f'Compute Capability: SM{cc[0]}{cc[1]}')
 "
 
 echo ""
-echo "Starting vLLM server..."
 echo "=============================================="
 echo ""
 
-# Set PYTHONPATH to use our local repos
-export PYTHONPATH=/workspace/flashinfer:/workspace/vllm
+exec "$@"
+ENTRYPOINT_SCRIPT
 
-# Default model (can be overridden via environment)
-MODEL=${VLLM_MODEL:-openai/gpt-oss-120b}
-
-exec vllm serve "$MODEL" \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --served-model-name gpt-oss-120b \
-    --quantization mxfp4 \
-    --mxfp4-backend CUTLASS \
-    --mxfp4-layers moe,qkv,o,lm_head \
-    --attention-backend FLASHINFER \
-    --kv-cache-dtype fp8 \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.70 \
-    --max-model-len 131072 \
-    --max-num-seqs 2 \
-    --max-num-batched-tokens 8192 \
-    --enable-prefix-caching \
-    --load-format safetensors \
-    "$@"
-STARTSCRIPT
-
-RUN chmod +x /workspace/start.sh
+RUN chmod +x /workspace/entrypoint.sh
 
 # =============================================================================
 # Runtime configuration
@@ -220,10 +204,6 @@ RUN chmod +x /workspace/start.sh
 
 WORKDIR /workspace
 
-# Ensure local repos are used
-ENV PYTHONPATH=/workspace/flashinfer:/workspace/vllm
-
-# Create model cache directory
 RUN mkdir -p ${HF_HOME} ${TRANSFORMERS_CACHE}
 
 EXPOSE 8000
@@ -231,5 +211,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-ENTRYPOINT ["/workspace/start.sh"]
-CMD []
+ENTRYPOINT ["/workspace/entrypoint.sh"]
+CMD ["bash"]

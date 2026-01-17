@@ -37,7 +37,7 @@ services:
               count: all
               capabilities: [gpu]
     
-    # Port mapping for vLLM API
+    # Port mapping
     ports:
       - "8000:8000"
     
@@ -62,7 +62,7 @@ services:
     
     # Environment configuration
     environment:
-      # MXFP4 Backend (CUTLASS for SM121)
+      # MXFP4 Backend
       - VLLM_MXFP4_BACKEND=CUTLASS
       
       # Attention backend
@@ -78,9 +78,25 @@ services:
       
       # Optional: HuggingFace token for gated models
       # - HF_TOKEN=${HF_TOKEN}
-      
-      # Optional: Debug logging
-      # - VLLM_MXFP4_DEBUG=1
+    
+    # vLLM server command with optimized settings
+    command: >
+      vllm serve openai/gpt-oss-120b
+        --host 0.0.0.0
+        --port 8000
+        --served-model-name gpt-oss-120b
+        --quantization mxfp4
+        --mxfp4-backend CUTLASS
+        --mxfp4-layers moe,qkv,o,lm_head
+        --attention-backend FLASHINFER
+        --kv-cache-dtype fp8
+        --tensor-parallel-size 1
+        --gpu-memory-utilization 0.70
+        --max-model-len 131072
+        --max-num-seqs 2
+        --max-num-batched-tokens 8192
+        --enable-prefix-caching
+        --load-format safetensors
     
     # Health check
     healthcheck:
@@ -91,14 +107,33 @@ services:
       start_period: 300s
 
 # =============================================================================
-# Alternative configurations (uncomment to use)
+# Alternative configurations
 # =============================================================================
 
   # Development mode - mounts local repos for live editing
-  # vllm-dev:
-  #   extends: vllm-mxfp4
-  #   volumes:
-  #     - ~/projects/vllm:/workspace/vllm
-  #     - ~/projects/flashinfer:/workspace/flashinfer
-  #   environment:
-  #     - PYTHONPATH=/workspace/flashinfer:/workspace/vllm
+  vllm-dev:
+    extends:
+      service: vllm-mxfp4
+    container_name: vllm-dev
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./.cache/flashinfer:/root/.cache/flashinfer
+      - ./.cache/vllm:/root/.cache/vllm
+      - ./.cache/ccache:/root/.ccache
+      # Mount local repos for development
+      - ~/projects/vllm:/workspace/vllm
+      - ~/projects/flashinfer:/workspace/flashinfer
+    environment:
+      - PYTHONPATH=/workspace/flashinfer:/workspace/vllm
+      - VLLM_MXFP4_BACKEND=CUTLASS
+      - VLLM_ATTENTION_BACKEND=FLASHINFER
+      - FLASHINFER_LOGLEVEL=0
+      - FLASHINFER_JIT_VERBOSE=0
+      - FLASHINFER_NVCC_THREADS=4
+      - TIKTOKEN_ENCODINGS_BASE=/workspace/tiktoken_encodings
+    # Override command to just start bash for development
+    command: ["bash"]
+    stdin_open: true
+    tty: true
+    profiles:
+      - dev
