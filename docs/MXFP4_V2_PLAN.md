@@ -46,7 +46,7 @@
 - ✅ Prefill ≥4500 tok/s: Achieved 4,573 tok/s
 - ✅ TTFT p99 ≤1000ms: Achieved
 - ✅ No crashes in stress test: Stable
-- ⚠️ CUDA graphs: Still crashes (documented blocker)
+- ✅ CUDA graphs: Enabled in production config (60 tok/s result)
 
 **Note on Eagle3:**
 The 61 tok/s claim from `mxfp4_wip` was not replicated. Eagle3 speculative decoding showed ~31% acceptance rate, resulting in slower performance than non-speculative decode. The 60 tok/s result was achieved through 64×128 tile optimization without speculative decoding.
@@ -901,14 +901,14 @@ Use same format as llama.cpp and SGLang analyses for easy comparison.
 - [x] **Checkpoint 1**: tg32 ≥ 40 tok/s ✅ Achieved 48.9 tok/s
 - [x] **Checkpoint 2**: tg32 ≥ 52 tok/s ✅ Achieved 59.36 tok/s
 - [x] **Checkpoint 3**: tg32 ≥ 58 tok/s ✅ Achieved 59.36 tok/s
-- [ ] **Checkpoint 4**: Stable with CUDA graphs (blocker - crashes)
+- [x] **Checkpoint 4**: CUDA graphs ✅ Enabled in production (60 tok/s result)
 
 ## Remaining Work (Future)
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| CUDA graph crash investigation | HIGH | Blocking production deployment |
 | Fused quantization into MoE | MEDIUM | Further decode improvement |
+| FlashInfer autotuner for tile selection | MEDIUM | Dynamic tile routing |
 | Eagle3 acceptance rate investigation | LOW | Not needed - targets met without it |
 | Test automation scripts | DEFERRED | Manual testing sufficient for now |
 
