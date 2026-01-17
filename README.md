@@ -54,8 +54,11 @@ docker compose down
 ```bash
 docker run --gpus all -p 8000:8000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -v ./.cache/flashinfer:/root/.cache/flashinfer \
     vllm-mxfp4-spark
 ```
+
+The volume mounts persist the model cache and JIT-compiled kernels between runs.
 
 ---
 
