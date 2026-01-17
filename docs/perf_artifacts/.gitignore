@@ -1,3 +1,0 @@
-# nsys profiles (too large for git, regenerate with scripts/profile_decode.py)
-*.nsys-rep
-*.sqlite
