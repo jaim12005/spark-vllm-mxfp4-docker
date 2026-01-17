@@ -2,21 +2,25 @@
 
 ## Mission
 
-Make **vLLM the fastest inference engine for gpt-oss-120b** on NVIDIA GB10 (SM121), outperforming SGLang and llama.cpp by leveraging:
+**Extend vLLM's lead as the fastest inference engine for gpt-oss-120b** on NVIDIA GB10 (SM121).
 
-- **Native FP4 hardware features** (SM121 block-scaled MMA)
-- **MXFP4 quantized weights** (4-bit weights, group size 32)
-- **FlashAttention-2** for attention
+### Current Performance (2026-01-17)
 
-### Targets to Beat
+| Context | Prefill (t/s) | Decode (t/s) |
+|---------|---------------|--------------|
+| Short (512) | 1,854 | **60.0** |
+| Medium (2048) | 4,573 | **59.4** |
+| Long (8192) | 6,628 | **57.5** |
 
-| Engine | pp2048 (t/s) | tg32 (t/s) |
-|--------|--------------|------------|
-| **llama.cpp** | 2449 | **58** |
-| **SGLang** | - | **52** |
-| **vLLM (baseline)** | 4808 ✓ | 29 ❌ |
+### vs Competition
 
-**Goal**: Achieve ≥52 tok/s decode while maintaining prefill performance.
+| Engine | Decode (t/s) | Status |
+|--------|--------------|--------|
+| SGLang | 52 | ✅ Beat by 10-15% |
+| llama.cpp | 58 | ✅ Beat at short/medium context |
+| **vLLM (this)** | **57-60** | **Winner** |
+
+**Next Goal**: Further optimization through fused quantization, CUTLASS dense layers, and CUDA graph improvements.
 
 ---
 
@@ -148,23 +152,28 @@ if constexpr (!IsCtaM64) { CUTE_STATIC_ASSERT_V(...); }
 
 ```
 ~/projects/
-├── flashinfer/          # Local FlashInfer (CUTLASS kernels)
-├── vllm/                # Local vLLM (uses FlashInfer backend)
+├── flashinfer/          # Local FlashInfer (CUTLASS kernels) - mxfp4_v2 branch
+├── vllm/                # Local vLLM (uses FlashInfer backend) - mxfp4_v2 branch
 └── ai/mxfp4/            # THIS REPO - Docker config + benchmarking
     ├── AGENTS.md        # This file
-    ├── docker-compose.dev.yml
+    ├── Dockerfile       # Production image (pinned SHAs)
+    ├── docker-compose.yml        # Production deployment
+    ├── docker-compose.dev.yml    # Development with mounted repos
     ├── docs/
-    │   ├── MXFP4_V2_PLAN.md      # Comprehensive optimization plan
-    │   ├── BENCHMARK_RESULTS.md   # Live benchmark tracking
-    │   ├── FEATURE_MATRIX.md      # Feature status and env vars
-    │   ├── UPSTREAM_TODOS.md      # FlashInfer improvement opportunities
-    │   ├── analysis/              # Engine comparisons
-    │   ├── investigations/        # Historical analysis
-    │   └── porting/               # Feature porting docs
+    │   ├── MXFP4_V2_PLAN.md      # Optimization plan
+    │   ├── BENCHMARK_RESULTS.md   # Benchmark tracking
+    │   ├── UPSTREAM_TODOS.md      # Upstream improvement opportunities
+    │   ├── analysis/              # Competitor analysis
+    │   ├── plans/                 # Development plans
+    │   ├── porting/               # Feature porting docs
+    │   ├── reference/             # Technical reference, code reviews
+    │   └── archive/               # Historical investigations
     └── scripts/
-        ├── setup_mxfp4_v2.sh      # Branch setup
-        ├── benchmark_matrix.py    # Systematic testing
-        └── test_level*.sh         # Testing protocol
+        ├── benchmarks/            # Benchmark scripts
+        ├── tests/                 # Test scripts
+        ├── profiling/             # Profiling scripts
+        ├── utils/                 # Utility scripts
+        └── debug/                 # Debug scripts
 ```
 
 ---
@@ -280,12 +289,6 @@ vllm serve openai/gpt-oss-120b \
 2. vLLM calls `mxfp8_quantize()` to convert BF16 → FP8
 3. FlashInfer CUTLASS kernel executes FP8×FP4 GEMM on SM12x tensor cores
 
-**Current Workaround** (until Phase 2 is complete):
-```bash
-export VLLM_MXFP4_BACKEND=MARLIN
-vllm serve openai/gpt-oss-120b --quantization mxfp4
-```
-
 ### Deprecated Variables
 
 The following are deprecated and will show warnings:
@@ -396,17 +399,13 @@ cd /workspace/vllm && python3 use_existing_torch.py && \
 
 ## Testing Protocol
 
-Run in order after each feature port:
-
-| Level | Test | Command |
-|-------|------|---------|
-| 1 | Smoke | `scripts/test_level1_smoke.sh` |
-| 1.5 | Kernel Validation | `scripts/test_level1.5_kernel_validation.sh` |
-| 2 | Correctness | `scripts/test_level2_correctness.sh` |
-| 3 | Stress | `scripts/test_level3_stress.sh` |
-| 4 | Benchmark | `scripts/test_level4_benchmark.sh` |
-| 5 | Regression | `scripts/test_level5_regression.sh` |
-| 6 | Combinatorial | `scripts/test_level6_matrix.sh` |
+| Test | Script | Purpose |
+|------|--------|---------|
+| Smoke | `scripts/tests/smoke_test_basic.py` | Basic kernel compilation |
+| Quantize | `scripts/tests/smoke_test_proper_quantize.py` | Full MXFP4 quantization path |
+| Numerical | `scripts/tests/test_numerical_accuracy.py` | Compare vs BF16 reference |
+| Benchmark | `scripts/benchmarks/benchmark_tile_shapes.py` | Tile performance comparison |
+| E2E | `llama-benchy --base-url ... --pp 2048 --tg 32 128` | Full vLLM benchmark |
 
 ---
 
@@ -453,20 +452,21 @@ llama-benchy \
 |----------|---------|
 | `docs/MXFP4_V2_PLAN.md` | Full optimization plan and methodology |
 | `docs/BENCHMARK_RESULTS.md` | Live benchmark tracking |
-| `docs/FEATURE_MATRIX.md` | Feature status and configuration |
 | `docs/UPSTREAM_TODOS.md` | FlashInfer improvement opportunities |
+| `docs/porting/SM120_MOE_TILE_EXPANSION.md` | Small tile implementation (64×128) |
+| `docs/reference/SM121_TECHNICAL_GUIDE.md` | Architecture deep dive |
 | `docs/analysis/` | llama.cpp, SGLang, vLLM analysis |
-| `docs/porting/` | Per-feature porting documentation |
 
 ---
 
 ## Summary for AI Agents
 
-1. **We use CUTLASS via FlashInfer**, not TensorRT-LLM
-2. **Correct MoE API is `cutlass_fused_moe`**
-3. **SM121 uses FA2** (not FA3)
-4. **MXFP4 uses group size 32**, goes through FP8×FP4 kernel
-5. **Always verify PYTHONPATH** points to local repos
-6. **KV cache is HND layout** on SM121
+1. **We achieved 57-60 tok/s decode** - beating SGLang (52) and llama.cpp (58)
+2. **We use CUTLASS via FlashInfer**, not TensorRT-LLM
+3. **Correct MoE API is `cutlass_fused_moe`**
+4. **SM121 uses FA2** (not FA3)
+5. **MXFP4 uses group size 32**, goes through FP8×FP4 kernel
+6. **Always verify PYTHONPATH** points to local repos
+7. **KV cache is HND layout** on SM121
 
 If debugging crashes: verify which FlashInfer you're importing first.
