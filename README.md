@@ -28,6 +28,36 @@ See the [discussion on NVIDIA Developer Forums](https://forums.developer.nvidia.
 
 ---
 
+## What's Included
+
+### SM120/SM121 MXFP4 MoE Kernel
+- **First implementation** of CUTLASS block-scaled MXFP4 MoE GEMM for DGX Spark (GB10)
+- Automatic tile selection optimized for decode (64×128) and prefill (128×128+)
+- CUTLASS patches enabling small-tile compilation (previously broken)
+- 2x decode throughput improvement over baseline
+
+### Full MXFP4 Quantization Stack  
+- **MoE layers** - CUTLASS FP8×FP4 grouped GEMM
+- **QKV projections** - MXFP4 attention inputs
+- **O projections** - MXFP4 attention outputs
+- **LM head** - MXFP4 logits computation with Blackwell detection
+
+### Unified Configuration API
+- `--mxfp4-backend` - Single flag to select CUTLASS, MARLIN, TRITON, or auto
+- `--mxfp4-layers` - Fine-grained control over which layers to quantize
+- Clean deprecation of legacy environment variables
+
+### FP8 KV Cache with Attention Sinks
+- FP8 E4M3 KV cache support for memory efficiency
+- Compatible with GPT-OSS-120B attention sink mechanism
+
+### Production-Ready Docker
+- 30-minute initial build, instant rebuilds on updates
+- Git/ccache/pip caching with BuildKit
+- Optimized docker-compose with tuned vLLM settings
+
+---
+
 ## Quick Start
 
 ### Build
