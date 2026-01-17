@@ -96,7 +96,7 @@ services:
         --max-num-seqs 2
         --max-num-batched-tokens 8192
         --enable-prefix-caching
-        --load-format safetensors
+        --load-format fastsafetensors
     
     # Health check
     healthcheck:
