@@ -153,6 +153,24 @@ docker builder prune --filter type=exec.cachemount
 
 ---
 
+## Future Work
+
+**Upstreaming**
+- Contribute small-tile CUTLASS patches (64×128) to FlashInfer upstream
+- Work with NVIDIA on CUTLASS Blackwell block-scaled improvements
+
+**Performance Optimizations**
+- Use FlashInfer autotuner to dynamically select optimal tile shapes based on workload
+- Finalize kernel fusion (combine operations to reduce memory bandwidth)
+- Fuse activation quantization directly into MoE GEMM kernel (eliminate separate quantize pass)
+- Use CUTLASS for dense layers (QKV, O projections, LM head) instead of Marlin fallback
+
+**New Features**
+- Speculative decoding with Eagle3 tree-based verification
+- Support for multiple quantization modes: native BF16, MXFP8, MXFP4
+
+---
+
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) - Project context and AI assistant guide
