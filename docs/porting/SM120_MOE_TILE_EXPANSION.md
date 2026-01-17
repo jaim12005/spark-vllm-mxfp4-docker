@@ -1,5 +1,23 @@
 # SM120 MoE Tile Expansion Plan
 
+> **✅ SMALL TILE SUPPORT FIXED (2026-01-16):** Small tiles (64×128, 128×64, 64×64) now compile
+> and run correctly. The fix was in `sm120_blockscaled_mma_builder.inl`:
+>
+> **Root cause:** Scale factor SMEM layouts used `TileM / 128` which gave 0 for M<128.
+> **Fix:** Use `ceil_div` to ensure at least 1 block, and pad TMA tile shapes to 128.
+>
+> Files changed:
+> - `sm120_blockscaled_mma_builder.inl`: Use `ceil_div` for `SFA_NumBlocks`/`SFB_NumBlocks`
+> - `sm120_blockscaled_mma_array_tma.hpp`: Add `TileShape_SFA`/`TileShape_SFB` for TMA padding
+> - `sm120_blockscaled_mma_tma.hpp`: Same TMA padding fix
+
+> **✅ KEY FIX (2026-01-16):** The garbage output issue was caused by custom CUTLASS modifications
+> to the epilogue tile selection. **Reverting CUTLASS to upstream fixed the issue.** The model
+> now produces coherent output ("Paris" for "The capital of France is").
+>
+> Root cause: Dynamic EpiN=16 selection caused `SM90_U32x1_STSM_N` (8 elements) to be used instead
+> of `SM90_U32x2_STSM_N` (16 elements), resulting in half the output being zeroed.
+
 > **⚠️ KEY FINDING (2026-01-14):** The tcgen05 tensor core has a **hardware minimum of M=64**. 
 > Tiles smaller than 64 in the M dimension are impossible. The solution is to **swap M and N**
 > dimensions, leveraging N's minimum of 8. See [Section 15](#15-hardware-constraint-tcgen05-minimum-tile-sizes).
@@ -923,19 +941,46 @@ Given the hardware constraint, our implementation uses M/N swap for small tiles:
 1. ✅ **Macro-based namespaces**: Reduce duplication with `DEFINE_SM120_MXFP4_TRANSPOSED_NAMESPACE`
 2. ✅ **M/N swap in launcher**: `#if TILE_M < 128` swaps A/B pointers and uses ColumnMajor output
 3. ✅ **Python tile selection**: Threshold-based selection picks smallest tile that fits
-4. 🔄 **Benchmark**: Validate decode performance gains with real workloads
+4. ✅ **Benchmark**: Validated decode performance gains (see Section 14)
 
-## 14. Performance Analysis (Theoretical)
+## 14. Performance Analysis (Measured 2026-01-17)
 
-Since the `TILE_M=64` kernel currently falls back to 128 due to compilation issues, we cannot measure actual GPU time reduction yet. However, we have validated the selection logic and calculated the theoretical work reduction:
+### 14.1 Tile Shape Benchmark Results
 
-| Scenario | Logical Rows | Computed Rows (M=128) | Computed Rows (M=64) | Work Reduction |
-|----------|--------------|-----------------------|----------------------|----------------|
-| **1 Token Decode** | 8 | 1024 | 512 | **50%** |
-| **8 Tokens Decode** | 64 | 8192 | 4096 | **50%** |
-| **Skewed (64 tok)** | 512 | 13696 | 7040 | **48.6%** |
+**Test Configuration:**
+- Hidden size: 2944, Intermediate size: 7680 (gpt-oss-120b dimensions)
+- Num experts: 128, top_k=2
+- GPU: GB10 (SM121)
 
-The Python-side selection logic correctly picks `TILE_M=64` for <= 64 tokens, ensuring that once the kernel compilation is fixed, these savings will be realized automatically.
+| Tokens | 64×128 (ms) | 128×128 (ms) | Winner | Improvement |
+|--------|-------------|--------------|--------|-------------|
+| **1** | 0.53 | **0.41** | 128×128 | -23% faster |
+| **4** | **1.40** | 1.41 | 64×128 | ~equal |
+| **16** | **4.20** | 5.16 | 64×128 | **19% faster** |
+| **64** | **14.11** | 14.49 | 64×128 | 3% faster |
+
+### 14.2 Key Findings
+
+1. **Single-token decode**: Surprisingly, 128×128 is 23% faster than 64×128
+   - Likely due to kernel launch overhead dominating at tiny batch sizes
+   - May also be occupancy/register pressure differences
+
+2. **4+ tokens**: 64×128 is equal or better
+   - At 16 tokens: **19% faster** - significant decode optimization
+   - At 64 tokens: 3% faster - modest but consistent
+
+3. **Recommendation**: Adjust tile selection threshold
+   - Current: 64×128 for < 64 tokens
+   - Suggested: 128×128 for ≤ 2 tokens, 64×128 for 3-63 tokens
+
+### 14.3 Theoretical vs Measured
+
+The theoretical 50% work reduction from smaller tiles does not directly translate to 50% time reduction because:
+- Kernel launch overhead is fixed regardless of tile size
+- Memory bandwidth may be the bottleneck, not compute
+- Smaller tiles may have lower occupancy or worse cache behavior
+
+The measured 19% improvement at 16 tokens is still a significant win for decode-heavy workloads.
 
 ## 16. CUTLASS Framework Patches for N < 128 Support (2026-01-15)
 

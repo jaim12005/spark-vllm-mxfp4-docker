@@ -210,6 +210,8 @@ docker exec vllm-dev python3 -c "import flashinfer; print(flashinfer.__file__)"
 ```bash
 docker exec -it vllm-dev bash -c '
 export PYTHONPATH=/workspace/flashinfer:/workspace/vllm
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 vllm serve openai/gpt-oss-120b \
   --host 0.0.0.0 \
   --port 8000 \
