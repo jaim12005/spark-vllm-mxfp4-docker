@@ -36,6 +36,20 @@ See the [discussion on NVIDIA Developer Forums](https://forums.developer.nvidia.
 docker build -t vllm-mxfp4-spark .
 ```
 
+### Download the Model
+
+```bash
+# Install uv (fast Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.local/bin/env
+
+# Install huggingface hub CLI
+uv tool install huggingface_hub
+
+# Download gpt-oss-120b (~240GB)
+hf download openai/gpt-oss-120b
+```
+
 ### Run with Docker Compose (Recommended)
 
 ```bash
