@@ -64,12 +64,6 @@ services:
     
     # Environment configuration
     environment:
-      # MXFP4 Backend
-      - VLLM_MXFP4_BACKEND=CUTLASS
-      
-      # Attention backend
-      - VLLM_ATTENTION_BACKEND=FLASHINFER
-      
       # FlashInfer settings
       - FLASHINFER_LOGLEVEL=0
       - FLASHINFER_JIT_VERBOSE=0

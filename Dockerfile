@@ -27,7 +27,7 @@ LABEL description="vLLM with optimized MXFP4 for DGX Spark (SM121/GB10)"
 # Pinned versions - our tested configurations
 # =============================================================================
 
-ARG VLLM_SHA=a461bc39bc32a317b6315f4b064af4ef3295aee1
+ARG VLLM_SHA=045293d82b832229560ac4a13152a095af603b6e
 ARG FLASHINFER_SHA=1660ee8d740b0385f235519f9e2750db944d1838
 ARG CUTLASS_SHA=11af7f02ab52c9130e422eeb4b44042fbd60c083
 
@@ -67,12 +67,13 @@ ENV FLASHINFER_JIT_VERBOSE=0
 ENV FLASHINFER_LOGLEVEL=0
 ENV FLASHINFER_NVCC_THREADS=4
 
-# CUDA architecture
-ENV TORCH_CUDA_ARCH_LIST="12.1"
+# CUDA architecture - SM120/SM121 only (DGX Spark)
+# This avoids compiling for SM80/SM90 which wastes build time
+# TORCH_CUDA_ARCH_LIST: Used by PyTorch/vLLM extension builds
+ENV TORCH_CUDA_ARCH_LIST="12.0;12.1"
 
-# Model cache
+# Model cache (HF_HOME is the modern unified path)
 ENV HF_HOME=/root/.cache/huggingface
-ENV TRANSFORMERS_CACHE=/root/.cache/huggingface/transformers
 
 # Use local repos
 ENV PYTHONPATH=/workspace/flashinfer:/workspace/vllm
@@ -90,7 +91,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     ccache \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install uv
+    && pip install uv \
+    && pip uninstall -y flash-attn 2>/dev/null || true  # Remove NGC flash-attn to avoid operator conflicts
 
 # =============================================================================
 # Clone repositories at pinned versions
@@ -145,8 +147,11 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install -r requirements.txt 2>/dev/null || true
 
 # Build and install vLLM
+# Note: This step compiles CUDA kernels and takes 20-40 minutes on first build.
+# Ccache speeds up subsequent rebuilds significantly.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     --mount=type=cache,id=ccache,target=/root/.ccache \
+    --mount=type=cache,id=vllm-build,target=/workspace/vllm/build \
     uv pip install --no-build-isolation --no-deps -e .
 
 # Install additional tools

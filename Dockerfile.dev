@@ -68,8 +68,9 @@ ENV FLASHINFER_JIT_VERBOSE=0
 ENV FLASHINFER_LOGLEVEL=0
 ENV FLASHINFER_NVCC_THREADS=4
 
-# PyTorch CUDA architecture
-ENV TORCH_CUDA_ARCH_LIST="12.1"
+# CUDA architecture - SM120/SM121 only (DGX Spark)
+# This avoids compiling for SM80/SM90 which wastes build time
+ENV TORCH_CUDA_ARCH_LIST="12.0;12.1"
 
 # NOTE: vLLM runtime configuration (VLLM_*, attention backends, MoE kernels)
 # should be set at runtime via docker-compose.yml or command line, not here.
@@ -91,7 +92,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     ccache \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install uv
+    && pip install uv \
+    && pip uninstall -y flash-attn 2>/dev/null || true  # Remove NGC flash-attn to avoid operator conflicts
 
 # =============================================================================
 # Workspace setup
@@ -205,8 +207,10 @@ echo "Quick Commands"
 echo "=============================================="
 echo ""
 echo "Install/Reinstall:"
-echo "  FlashInfer: cd /workspace/flashinfer && git submodule update --init --recursive && uv pip install --no-build-isolation -e . -v"
-echo "  vLLM:       cd /workspace/vllm && python3 use_existing_torch.py && uv pip install -r requirements/build.txt && uv pip install --no-build-isolation -e ."
+echo "  FlashInfer: /workspace/install-flashinfer.sh"
+echo "  vLLM:       /workspace/install-vllm.sh"
+echo ""
+echo "  (These scripts set TORCH_CUDA_ARCH_LIST=12.0;12.1 to avoid building SM80)"
 echo ""
 echo "Serve Model:"
 echo "  python -m vllm.entrypoints.openai.api_server --model openai/gpt-oss-120b --quantization mxfp4 --host 0.0.0.0 --port 8000"
@@ -242,6 +246,11 @@ RUN cat > /workspace/install-vllm.sh << 'EOF'
 #!/bin/bash
 set -e
 cd /workspace/vllm
+
+# Ensure we only build for SM120/SM121 (DGX Spark)
+# This avoids wasting time compiling SM80/SM90 kernels
+export TORCH_CUDA_ARCH_LIST="12.0;12.1"
+
 python3 use_existing_torch.py
 sed -i "/flashinfer/d" requirements/cuda.txt 2>/dev/null || true
 uv pip install -r requirements/build.txt

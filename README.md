@@ -36,6 +36,8 @@ See the [discussion on NVIDIA Developer Forums](https://forums.developer.nvidia.
 docker build -t vllm-mxfp4-spark .
 ```
 
+Note: First build takes ~30 minutes (compiling CUDA kernels). Subsequent builds are faster due to ccache.
+
 ### Download the Model
 
 ```bash
@@ -58,6 +60,9 @@ docker compose up -d
 
 # View logs
 docker compose logs -f
+
+# Enter the container
+docker compose exec vllm-mxfp4 bash
 
 # Stop
 docker compose down
@@ -214,6 +219,6 @@ docker builder prune --filter type=exec.cachemount
 
 | Component | SHA | Repository |
 |-----------|-----|------------|
-| vLLM | `a461bc39` | [christopherowen/vllm](https://github.com/christopherowen/vllm/tree/mxfp4_v2) |
+| vLLM | `045293d8` | [christopherowen/vllm](https://github.com/christopherowen/vllm/tree/mxfp4_v2) |
 | FlashInfer | `1660ee8d` | [christopherowen/flashinfer](https://github.com/christopherowen/flashinfer/tree/mxfp4_v2) |
 | CUTLASS | `11af7f02` | [christopherowen/cutlass](https://github.com/christopherowen/cutlass/tree/mxfp4_v2) |
