@@ -186,7 +186,7 @@ docker builder prune --filter type=exec.cachemount
 
 - [SGLang Analysis](docs/analysis/SGLANG_ANALYSIS.md) - How SGLang achieves 52 tok/s
 - [llama.cpp Analysis](docs/analysis/LLAMA_CPP_ANALYSIS.md) - How llama.cpp achieves 58 tok/s
-- [vLLM Baseline Analysis](docs/analysis/VLLM_BASELINE_ANALYSIS.md) - Why vLLM started at 29 tok/s
+- [vLLM Baseline Analysis](docs/analysis/VLLM_BASELINE_ANALYSIS.md) - Why vLLM started at 30 tok/s
 
 ---
 
