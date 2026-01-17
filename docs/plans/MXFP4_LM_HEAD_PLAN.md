@@ -450,6 +450,6 @@ Implement Phase 1-3 with `group_gemm_mxfp8_mxfp4_nt_groupwise()` first. Benchmar
 
 | 1 | `vllm/.../quantization/mxfp4.py` | **Modify**: `get_quant_method()` to return MXFP4 for LinearBase |
 
-| 4 | `docs/porting/MXFP4_LM_HEAD_PLAN.md` | This plan document |
+| 4 | `docs/plans/MXFP4_LM_HEAD_PLAN.md` | This plan document |
 
 | 4 | `scripts/test_mxfp4_lm_head.py` | Validation script |

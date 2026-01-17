@@ -271,7 +271,7 @@ git checkout -b feature/X mxfp4_v2
 # Read the code carefully, understand what it does and why
 
 # 3. CRITICAL REVIEW (MANDATORY)
-# Document in docs/porting/FEATURE_X.md:
+# Document in docs/plans/FEATURE_X.md:
 # - What does this implementation do?
 # - What are its limitations?
 # - What assumptions does it make?
@@ -706,7 +706,7 @@ Improvement opportunities identified in FlashInfer (durable references):
 
 ## Phase 11: Critical Review Template
 
-For each ported feature, create `docs/porting/FEATURE_<name>.md`:
+For each ported feature, create `docs/plans/FEATURE_<name>.md`:
 
 ```markdown
 # Feature: <Name>
@@ -958,7 +958,7 @@ export FLASHINFER_JIT_VERBOSE=1
 | `docs/MXFP4_V2_PLAN.md` | ✅ Done | This document |
 | `docs/BENCHMARK_RESULTS.md` | ✅ Done | Live benchmark tracking |
 | `docs/UPSTREAM_TODOS.md` | ✅ Done | FlashInfer improvement opportunities |
-| `docs/porting/SM120_MOE_TILE_EXPANSION.md` | ✅ Done | 64×128 tile implementation |
+| `docs/plans/SM120_MOE_TILE_EXPANSION.md` | ✅ Done | 64×128 tile implementation |
 | `docs/analysis/LLAMA_CPP_ANALYSIS.md` | ✅ Done | llama.cpp kernel analysis |
 | `docs/analysis/SGLANG_ANALYSIS.md` | ✅ Done | SGLang analysis |
 | `docs/analysis/VLLM_BASELINE_ANALYSIS.md` | ✅ Done | Upstream vLLM decode analysis |

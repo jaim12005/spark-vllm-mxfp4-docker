@@ -157,12 +157,17 @@ docker builder prune --filter type=exec.cachemount
 
 **Upstreaming**
 - Contribute small-tile CUTLASS patches (64×128) to FlashInfer upstream
+- Contribute MXFP4 layer selection (`--mxfp4-layers`) and SM121 fixes to vLLM upstream
 - Work with NVIDIA on CUTLASS Blackwell block-scaled improvements
 
 **Performance Optimizations**
-- Use FlashInfer autotuner to dynamically select optimal tile shapes based on workload
-- Finalize kernel fusion (combine operations to reduce memory bandwidth)
-- Fuse activation quantization directly into MoE GEMM kernel (eliminate separate quantize pass)
+- Use FlashInfer autotuner to dynamically select optimal tile shapes based on workload ([plan](docs/plans/SMALL_TILE_SUPPORT_PLAN.md))
+- Benchmark additional tile shapes (64×64, 64×256, 128×64) for different workload sizes
+- Benchmark small-M tiles (M=8, 16, 32) and small-N tiles for decode-oriented workloads
+- Fuse activation quantization directly into MoE GEMM kernel ([plan](docs/plans/SM121_MOE_FUSE_BF16_TO_FP8_EXPAND_PLAN.md))
+- Native FP4×FP4 block-scale MMA (llama.cpp uses `mxf4.block_scale` instruction, we use FP8×FP4)
+- Low-M CUDA core dispatch for dense layers (TRT-LLM uses CUDA cores for M≤4, we always use tensor cores)
+- Evaluate [ThunderKittens](https://github.com/HazyResearch/ThunderKittens) as alternative to CUTLASS (simpler tile primitives, Blackwell MXFP8/NVFP4 support)
 - Use CUTLASS for dense layers (QKV, O projections, LM head) instead of Marlin fallback
 
 **New Features**
@@ -180,7 +185,7 @@ docker builder prune --filter type=exec.cachemount
 
 - [AGENTS.md](AGENTS.md) - Project context and AI assistant guide
 - [docs/reference/](docs/reference/) - Technical deep dive (SM121 architecture, CUTLASS details)
-- [docs/porting/](docs/porting/) - Feature implementation documentation
+- [docs/plans/](docs/plans/) - Feature implementation documentation
 
 ### Competitor Analysis
 

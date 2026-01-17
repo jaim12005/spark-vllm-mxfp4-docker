@@ -72,7 +72,7 @@ Implemented 64×128 tile shapes for small-M workloads:
 
 64×128 is **19% faster** for typical decode workloads (16 tokens).
 
-See: `docs/porting/SM120_MOE_TILE_EXPANSION.md` for full implementation details.
+See: `docs/plans/SM120_MOE_TILE_EXPANSION.md` for full implementation details.
 
 ---
 
@@ -580,7 +580,7 @@ Test Eagle3 with FlashInfer attention to verify speculative decoding still works
 Each benchmark run should link to:
 1. Full metadata file in `docs/TEST_LOGS/`
 2. nsys profile (if captured) in `docs/perf_artifacts/`
-3. Feature porting doc in `docs/porting/`
+3. Feature porting doc in `docs/plans/`
 
 | Run ID | Date | Config | tg32 | Notes |
 |--------|------|--------|------|-------|
@@ -926,7 +926,7 @@ The SM120/SM121 CUTLASS kernel was implemented with:
 
 1. **Implement MXFP4 for lm_head** - Potentially +30-45% decode speedup
 2. **Fuse BF16→FP8 activations into MoE expand (remove standalone `mxfp8_quantize()`)** - Recover CUTLASS decode regression on SM121  
-   - Plan: `docs/porting/SM121_MOE_FUSE_BF16_TO_FP8_EXPAND_PLAN.md`
+   - Plan: `docs/plans/SM121_MOE_FUSE_BF16_TO_FP8_EXPAND_PLAN.md`
 2. **Enable CUDA graphs** - Remove `--enforce-eager`
 3. **Test speculative decoding** - Eagle3 with CUTLASS backend
 4. **Profile dense GEMV kernels** - Investigate cuBLAS vs custom implementations

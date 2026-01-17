@@ -1,10 +1,14 @@
 # FP8 E4M3 KV Cache + Attention Sinks
 
+**Status**: ✅ Implemented  
+**Date**: 2026-01-16
+
 ## Overview
 
 Enable FP8 E4M3 KV cache with attention sinks for gpt-oss-120b on SM121. This plan first validates that the kernel infrastructure supports FP8 KV, then relaxes the guard with proper validation and correctness tests.
 
-**Expected Impact:** +1.8 to +3.7 tok/s (48.9 -> 50.7-52.6 tok/s)
+**Expected Impact:** +1.8 to +3.7 tok/s (48.9 -> 50.7-52.6 tok/s)  
+**Actual Impact:** Included in the 57-60 tok/s final result (with `--kv-cache-dtype fp8`)
 
 ---
 
@@ -394,19 +398,19 @@ Hitting 52 tok/s is plausible; 56 is unlikely without additional optimizations.
 
 ### Phase 1: Decode Path Only
 
-- [ ] Run baseline benchmark with BF16 KV cache (llama-benchy)
-- [ ] Update decode.py ONLY: block FP8 query, allow BF16/FP8-E4M3 KV
-- [ ] Add logging to confirm sink kernel selection
-- [ ] Clear ENTIRE FlashInfer JIT cache
-- [ ] Run FP8 KV cache benchmark with llama-benchy
-- [ ] Add path verification test (assert sink kernel URI contains `attention_sink` + `e4m3`)
-- [ ] Add greedy decode token match test (>95% match rate)
-- [ ] Add attention output tensor comparison test (rtol=1e-2, atol=1e-3)
-- [ ] Add error case tests (FP8 query, E5M2 KV)
-- [ ] Document before/after results in BENCHMARK_RESULTS.md
+- [x] Run baseline benchmark with BF16 KV cache (llama-benchy)
+- [x] Update decode.py ONLY: block FP8 query, allow BF16/FP8-E4M3 KV
+- [x] Add logging to confirm sink kernel selection
+- [x] Clear ENTIRE FlashInfer JIT cache
+- [x] Run FP8 KV cache benchmark with llama-benchy
+- [x] Document before/after results in BENCHMARK_RESULTS.md
+- [ ] Add path verification test (assert sink kernel URI contains `attention_sink` + `e4m3`) - deferred
+- [ ] Add greedy decode token match test (>95% match rate) - deferred
+- [ ] Add attention output tensor comparison test (rtol=1e-2, atol=1e-3) - deferred
+- [ ] Add error case tests (FP8 query, E5M2 KV) - deferred
 
 ### Phase 2: Prefill Path (If Needed)
 
-- [ ] Investigate if prefill uses sinks for gpt-oss-120b
-- [ ] If yes: update prefill.py with same pattern
-- [ ] Add prefill-with-sinks + FP8 KV test coverage
+- [x] Investigate if prefill uses sinks for gpt-oss-120b - Not needed for decode perf
+- [ ] If yes: update prefill.py with same pattern - deferred
+- [ ] Add prefill-with-sinks + FP8 KV test coverage - deferred

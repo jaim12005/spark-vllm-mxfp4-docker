@@ -1,6 +1,8 @@
-# GPT-OSS-120B with MXFP4 on DGX Spark (SM121/GB10)
+# SM121 Technical Guide
 
-This Docker setup enables running GPT-OSS-120B with native MXFP4 quantization on NVIDIA DGX Spark (SM121/GB10 Blackwell-class GPU).
+Technical deep dive for SM121 (GB10/DGX Spark) architecture, covering CUTLASS internals, hardware limitations, and FlashInfer JIT compilation.
+
+> **Note**: For quick start and usage instructions, see the main [README.md](../../README.md).
 
 ## Key Components
 
@@ -191,140 +193,6 @@ The FlashInfer attention backend (`VLLM_ATTENTION_BACKEND=FLASHINFER`) should be
 
 ---
 
-## Quick Start
-
-### Build
-
-```bash
-docker build -t vllm-dgx-spark-mxfp4 .
-```
-
-### Run with Docker
-
-```bash
-# Basic run
-docker run --gpus all -p 8000:8000 vllm-dgx-spark-mxfp4 \
-    vllm serve openai/gpt-oss-120b \
-    --quantization mxfp4 \
-    --tensor-parallel-size 1 \
-    --max-model-len 8192
-
-# With model cache persistence
-docker run --gpus all -p 8000:8000 \
-    -v ~/.cache/huggingface:/root/.cache/huggingface \
-    vllm-dgx-spark-mxfp4 \
-    vllm serve openai/gpt-oss-120b --quantization mxfp4
-```
-
-### Run with Docker Compose
-
-```bash
-# Start service
-docker compose up -d
-
-# View logs
-docker compose logs -f
-
-# Stop service
-docker compose down
-```
-
-### Development Mode
-
-For active development with mounted source code:
-
-```bash
-# Build dev image
-docker build -f Dockerfile.dev -t vllm-dev .
-
-# Start dev environment
-docker compose -f docker-compose.dev.yml up -d dev
-
-# Shell into container
-docker compose -f docker-compose.dev.yml exec dev bash
-
-# Start vLLM server (from inside container)
-docker compose -f docker-compose.dev.yml --profile serve up
-```
-
----
-
-## Environment Variables
-
-### MXFP4 Backend Selection
-
-| Variable | Value | Description |
-|----------|-------|-------------|
-| `FLASHINFER_CUDA_ARCH_LIST` | `12.1f` | **Critical:** Must use `f` suffix for hardware FP4/FP8 |
-| `VLLM_USE_FLASHINFER_MOE_MXFP4_BF16` | `1` | Enable MXFP4 BF16 backend (CUTLASS) |
-| `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8` | `0` | Disable MXFP8 TRTLLM (not SM121) |
-| `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS` | `0` | Disable MXFP8 CUTLASS |
-| `VLLM_FLASHINFER_MOE_BACKEND` | `throughput` | Use throughput-optimized backend |
-| `VLLM_USE_FLASHINFER_MOE_FP4` | `1` | Enable FP4 MOE |
-
-### Performance Tuning
-
-| Variable | Value | Description |
-|----------|-------|-------------|
-| `VLLM_ATTENTION_BACKEND` | `FLASHINFER` | Use FlashInfer attention |
-| `VLLM_USE_CUDA_GRAPH` | `1` | Enable CUDA graphs (~60% speedup) |
-| `FLASHINFER_NVCC_THREADS` | `4` | Parallel JIT compilation |
-
-### Debugging
-
-| Variable | Value | Description |
-|----------|-------|-------------|
-| `FLASHINFER_LOGLEVEL` | `0-5` | API logging (0=off, 3=detailed) |
-| `FLASHINFER_JIT_VERBOSE` | `0-1` | JIT compilation logging |
-
----
-
-## Validation
-
-The container runs validation on startup. You can also validate manually:
-
-```bash
-docker run --gpus all vllm-dgx-spark-mxfp4 python -c "
-from vllm.platforms import current_platform
-import torch
-
-print(f'GPU: {torch.cuda.get_device_name(0)}')
-print(f'Compute Capability: {torch.cuda.get_device_capability()}')
-print(f'is_blackwell_class(): {current_platform.is_blackwell_class()}')
-"
-```
-
-Expected output for DGX Spark:
-```
-GPU: NVIDIA GB10
-Compute Capability: (12, 1)
-is_blackwell_class(): True
-```
-
----
-
-## API Usage
-
-Once running, the vLLM OpenAI-compatible API is available at `http://localhost:8000`:
-
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# List models
-curl http://localhost:8000/v1/models
-
-# Chat completion
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-oss-120b",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
----
-
 ## Troubleshooting
 
 ### `cvt.e2m1x2.f32 not supported on .target 'sm_121'`
@@ -478,16 +346,18 @@ The `__CUDA_ARCH_FAMILY_SPECIFIC__` macro enables hardware FP4 conversion:
 
 ---
 
-## Adding MXFP4 Support to FlashInfer for SM120/SM121
+## MXFP4 Support for SM120/SM121
+
+> **Status**: ✅ IMPLEMENTED (2026-01-17)
 
 ### Current State
 
 | Format | cuDNN | CUTLASS Standalone | CUTLASS Fused MoE |
 |--------|-------|-------------------|-------------------|
 | **NVFP4** | ✅ | ✅ | ✅ |
-| **MXFP4** | ✅ | ❌ | ❌ |
+| **MXFP4** | ✅ | ✅ | ✅ |
 
-**Problem**: GPT-OSS-120B uses MXFP4 quantization, but FlashInfer's CUTLASS kernels for SM120 only support NVFP4.
+MXFP4 support for SM120/SM121 is now complete. The implementation uses FP8×FP4 MMA with block scaling.
 
 ### MXFP4 vs NVFP4 Differences
 
@@ -581,42 +451,15 @@ Based on CUTLASS examples and GPT-OSS-120B dimensions:
 - **64×128×128 (PingPong)** - With Top-4 routing, each expert sees ~batch/4 tokens
 - For batch=64: ~16 tokens per expert → 64×M tiles are more efficient
 
-### Estimated Development Effort
+### Key Implementation Changes (Completed)
 
-| Task | Effort | Priority |
-|------|--------|----------|
-| Port MXFP4 standalone GEMM (SM100→SM120) | 2 days | High |
-| Port MXFP4 fused MoE (SM100→SM120) | 3 days | High |
-| Add PingPong schedule (64×128×128) | 2 days | Medium |
-| Add K=256 tile support | 1 day | Low |
-| Testing & validation | 2-3 days | High |
-| **Total** | **~10-12 days** | |
+The following changes were made to enable MXFP4 on SM120/SM121:
 
-### Files to Modify/Create
+1. **CUTLASS `ceil_div` fixes** - Fixed scale factor block calculations for small tiles (64×128)
+2. **TMA padding for small tiles** - Added `TileShape_SFA`/`TileShape_SFB` with proper padding
+3. **Tile selection heuristics** - `select_tile_mn_for_sm120()` selects 64×128 for decode
 
-| Action | File |
-|--------|------|
-| Create | `include/flashinfer/gemm/group_gemm_mxfp4_groupwise_sm120.cuh` |
-| Create | `include/flashinfer/gemm/fp4_gemm_mxfp4_template_sm120.h` |
-| Create | `csrc/cutlass_fused_moe_mxfp4_sm120.cu` |
-| Modify | `include/flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h` |
-| Modify | `flashinfer/gemm/gemm_base.py` |
-| Modify | `csrc/nv_internal/.../cutlass_heuristic.cpp` |
-| Modify | `flashinfer/jit/gemm/*.py` (JIT module generators) |
-
----
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `Dockerfile` | Production image with pre-built vLLM |
-| `Dockerfile.dev` | Development image with mounted source |
-| `docker-compose.yml` | Production deployment |
-| `docker-compose.dev.yml` | Development environment |
-| `fastsafetensors.patch` | Patch for faster distributed model loading |
-| `mxfp4_sm121.patch` | Route SM121 to CUTLASS backend (not TRT-LLM) |
-| `decorators_ngc.patch` | Fix NGC PyTorch `assume_32bit_indexing` compatibility |
+See `docs/plans/SM120_MOE_TILE_EXPANSION.md` for full implementation details.
 
 ---
 

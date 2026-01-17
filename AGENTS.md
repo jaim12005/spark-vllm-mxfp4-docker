@@ -163,9 +163,8 @@ if constexpr (!IsCtaM64) { CUTE_STATIC_ASSERT_V(...); }
     │   ├── MXFP4_V2_PLAN.md      # Optimization plan
     │   ├── BENCHMARK_RESULTS.md   # Benchmark tracking
     │   ├── UPSTREAM_TODOS.md      # Upstream improvement opportunities
-    │   ├── analysis/              # Competitor analysis
-    │   ├── plans/                 # Development plans
-    │   ├── porting/               # Feature porting docs
+    │   ├── analysis/              # Competitor analysis (llama.cpp, SGLang, TRT-LLM)
+    │   ├── plans/                 # Feature plans (implemented and future)
     │   ├── reference/             # Technical reference, code reviews
     │   └── archive/               # Historical investigations
     └── scripts/
@@ -289,14 +288,44 @@ vllm serve openai/gpt-oss-120b \
 2. vLLM calls `mxfp8_quantize()` to convert BF16 → FP8
 3. FlashInfer CUTLASS kernel executes FP8×FP4 GEMM on SM12x tensor cores
 
+### CLI Arguments
+
+#### `--mxfp4-layers` - Layer Selection
+
+Control which layer types are quantized with MXFP4:
+
+| Token | Layers Matched | Description |
+|-------|----------------|-------------|
+| `moe` | `*.experts.*` | MoE expert weights (default) |
+| `qkv` | `*.qkv_proj` | Fused QKV projection |
+| `o` | `*.o_proj` | Attention output projection |
+| `lm_head` | `lm_head` | Output logits projection |
+| `all` | All above | Shorthand for full quantization |
+
+**Default**: `--mxfp4-layers moe` (backwards compatible)
+
+**Recommended**: `--mxfp4-layers moe,qkv,o,lm_head` (full quantization, best performance)
+
+**Compatibility notes:**
+- LoRA: When enabled, QKV/O/lm_head fall back to BF16
+- Tied embeddings: lm_head falls back to BF16 when `tie_word_embeddings=True`
+
+### Environment Variables Reference
+
+| Variable | Options | Description |
+|----------|---------|-------------|
+| `VLLM_MXFP4_BACKEND` | `auto`, `MARLIN`, `CUTLASS`, `TRITON` | Backend selection (recommended over env vars below) |
+| `VLLM_ATTENTION_BACKEND` | `FLASHINFER`, `FLASH_ATTN` | Attention backend |
+| `FLASHINFER_LOGLEVEL` | `0`-`5` | API logging verbosity |
+| `FLASHINFER_JIT_VERBOSE` | `0`, `1` | JIT compilation output |
+| `FLASHINFER_NVCC_THREADS` | number | Parallel JIT threads |
+
 ### Deprecated Variables
 
-The following are deprecated and will show warnings:
-- `VLLM_MXFP4_MOE_KERNEL` → Use `VLLM_MXFP4_BACKEND`
-- `VLLM_MXFP4_ACTIVATION` → Use `VLLM_MXFP4_BACKEND`
-- `VLLM_USE_FLASHINFER_MOE_MXFP4_*` → Use `VLLM_MXFP4_BACKEND`
-
-See `docs/FEATURE_MATRIX.md` for full list.
+The following are deprecated - use `--mxfp4-backend` CLI instead:
+- `VLLM_MXFP4_MOE_KERNEL`
+- `VLLM_MXFP4_ACTIVATION`
+- `VLLM_USE_FLASHINFER_MOE_MXFP4_*`
 
 ---
 
@@ -453,9 +482,10 @@ llama-benchy \
 | `docs/MXFP4_V2_PLAN.md` | Full optimization plan and methodology |
 | `docs/BENCHMARK_RESULTS.md` | Live benchmark tracking |
 | `docs/UPSTREAM_TODOS.md` | FlashInfer improvement opportunities |
-| `docs/porting/SM120_MOE_TILE_EXPANSION.md` | Small tile implementation (64×128) |
+| `docs/plans/SM120_MOE_TILE_EXPANSION.md` | Small tile implementation (64×128) |
 | `docs/reference/SM121_TECHNICAL_GUIDE.md` | Architecture deep dive |
-| `docs/analysis/` | llama.cpp, SGLang, vLLM analysis |
+| `docs/reference/SM121_OPTIMIZATION_ANALYSIS.md` | Competitor analysis and optimization gaps |
+| `docs/analysis/` | llama.cpp, SGLang, TensorRT-LLM analysis |
 
 ---
 
