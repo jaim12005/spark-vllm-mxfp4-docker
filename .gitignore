@@ -11,6 +11,7 @@ test_outputs/
 
 # Profile outputs
 profile_outputs/
+profiles/
 
 # Nsight profiling files
 *.nsys-rep

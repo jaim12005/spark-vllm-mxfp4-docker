@@ -238,8 +238,21 @@ RUN cat > /workspace/install-flashinfer.sh << 'EOF'
 #!/bin/bash
 set -e
 cd /workspace/flashinfer
+
+# Check if FlashInfer is already importable
+if python -c "from flashinfer._build_meta import __version__; import flashinfer.jit" 2>/dev/null; then
+    echo "✓ FlashInfer already available"
+    if [ "$1" != "--force" ]; then
+        exit 0
+    fi
+    echo "  Forcing reinstall..."
+fi
+
+echo "Installing FlashInfer..."
 git submodule update --init --recursive
-uv pip install --no-build-isolation -e . -v
+uv pip install --no-build-isolation -e .
+
+echo "✓ FlashInfer installed"
 EOF
 
 RUN cat > /workspace/install-vllm.sh << 'EOF'
@@ -247,14 +260,39 @@ RUN cat > /workspace/install-vllm.sh << 'EOF'
 set -e
 cd /workspace/vllm
 
-# Ensure we only build for SM120/SM121 (DGX Spark)
-# This avoids wasting time compiling SM80/SM90 kernels
-export TORCH_CUDA_ARCH_LIST="12.0;12.1"
+# Fast path: already working (~10s check)
+if [ "$1" != "--force" ]; then
+    if python -c "from vllm.entrypoints.openai.api_server import run_server" 2>/dev/null; then
+        echo "✓ vLLM ready"
+        exit 0
+    fi
+fi
 
-python3 use_existing_torch.py
-sed -i "/flashinfer/d" requirements/cuda.txt 2>/dev/null || true
-uv pip install -r requirements/build.txt
-uv pip install --no-build-isolation -e .
+SO_COUNT=$(find /workspace/vllm/vllm -name "*.so" 2>/dev/null | wc -l)
+
+if [ "$SO_COUNT" -gt 0 ] && [ "$1" != "--force" ]; then
+    # Already compiled - just set up to use it (~30-60s)
+    echo "Found $SO_COUNT compiled extensions"
+    echo "Installing dependencies..."
+    
+    python3 use_existing_torch.py
+    sed -i "/flashinfer/d" requirements/cuda.txt 2>/dev/null || true
+    uv pip install -r requirements/build.txt -q
+    uv pip install -r requirements/cuda.txt -q 2>/dev/null || true
+    
+    echo "✓ vLLM ready"
+else
+    # Not compiled - compile it (~10-30 min)
+    echo "Compiling vLLM..."
+    
+    python3 use_existing_torch.py
+    sed -i "/flashinfer/d" requirements/cuda.txt 2>/dev/null || true
+    uv pip install -r requirements/build.txt
+    export TORCH_CUDA_ARCH_LIST="12.0;12.1"
+    uv pip install --no-build-isolation -e .
+    
+    echo "✓ vLLM compiled and installed"
+fi
 EOF
 
 RUN chmod +x /workspace/install-flashinfer.sh /workspace/install-vllm.sh

@@ -30,6 +30,12 @@ services:
               capabilities: [gpu]
     ipc: host
     
+    # Enable full nsys profiling (CPU samples, context switches)
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    
     # Keep container running for interactive use
     stdin_open: true
     tty: true
@@ -60,8 +66,8 @@ services:
       - ./.cache/uv:/root/.cache/uv
       - ./.cache/ccache:/root/.ccache
       
-      # Python site-packages cache (for editable installs to persist)
-      - ./.cache/site-packages:/usr/local/lib/python3.12/dist-packages-dev
+      # Persist pip metadata for faster reinstalls after container restart
+      - ./.cache/pip-metadata:/root/.cache/pip
     
     # Environment variables
     environment:
